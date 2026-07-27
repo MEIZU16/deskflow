@@ -1,0 +1,29 @@
+<map id="src/lib/platform/EiEmulatedInputState.h" name="src/lib/platform/EiEmulatedInputState.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="316,5,494,44"/>
+<area shape="rect" id="Node000002" href="$EiEmulatedInputState_8cpp.html" title=" " alt="" coords="216,92,394,131"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="373,53,329,94,325,89,369,56"/>
+<area shape="rect" id="Node000003" href="$EiScreen_8h.html" title=" " alt="" coords="418,99,594,124"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="439,51,495,98,489,98,438,57"/>
+<area shape="rect" id="Node000004" href="$EiEventQueueBuffer_8h.html" title=" " alt="" coords="101,179,258,217"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="444,130,252,181,251,176,449,127"/>
+<area shape="rect" id="Node000006" href="$EiScreen_8cpp.html" title=" " alt="" coords="412,272,601,297"/>
+<area shape="poly" id="edge9_Node000003_Node000006" title=" " alt="" coords="508,137,508,273,504,271,504,141"/>
+<area shape="rect" id="Node000007" href="$EiKeyState_8h.html" title=" " alt="" coords="282,186,469,210"/>
+<area shape="poly" id="edge6_Node000003_Node000007" title=" " alt="" coords="478,131,394,188,392,183,473,133"/>
+<area shape="rect" id="Node000009" href="$PortalInputCapture_8h.html" title=" " alt="" coords="544,179,719,217"/>
+<area shape="poly" id="edge10_Node000003_Node000009" title=" " alt="" coords="536,130,607,178,601,178,535,135"/>
+<area shape="rect" id="Node000011" href="$PortalRemoteDesktop_8h.html" title=" " alt="" coords="744,179,935,217"/>
+<area shape="poly" id="edge13_Node000003_Node000011" title=" " alt="" coords="567,125,768,178,763,179,567,131"/>
+<area shape="rect" id="Node000005" href="$EiEventQueueBuffer_8cpp.html" title=" " alt="" coords="5,265,162,304"/>
+<area shape="poly" id="edge4_Node000004_Node000005" title=" " alt="" coords="150,227,106,267,103,263,145,229"/>
+<area shape="poly" id="edge5_Node000004_Node000006" title=" " alt="" coords="267,219,463,271,459,273,266,224"/>
+<area shape="poly" id="edge8_Node000007_Node000006" title=" " alt="" coords="407,216,491,272,486,272,405,221"/>
+<area shape="rect" id="Node000008" href="$EiKeyState_8cpp.html" title=" " alt="" coords="186,272,387,297"/>
+<area shape="poly" id="edge7_Node000007_Node000008" title=" " alt="" coords="355,220,299,274,297,270,350,222"/>
+<area shape="poly" id="edge11_Node000009_Node000006" title=" " alt="" coords="594,225,524,274,522,269,589,227"/>
+<area shape="rect" id="Node000010" href="$PortalInputCapture_8cpp.html" title=" " alt="" coords="625,265,800,304"/>
+<area shape="poly" id="edge12_Node000009_Node000010" title=" " alt="" coords="661,226,697,266,692,264,659,231"/>
+<area shape="poly" id="edge14_Node000011_Node000006" title=" " alt="" coords="754,221,553,274,552,269,748,222"/>
+<area shape="rect" id="Node000012" href="$PortalRemoteDesktop_8cpp.html" title=" " alt="" coords="825,265,1016,304"/>
+<area shape="poly" id="edge15_Node000011_Node000012" title=" " alt="" coords="869,226,905,266,900,264,867,231"/>
+</map>
