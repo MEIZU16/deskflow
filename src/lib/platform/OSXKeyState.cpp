@@ -613,7 +613,7 @@ void OSXKeyState::postKeyboardKey(CGKeyCode virtualKey, bool keyDown)
   }
 }
 
-void OSXKeyState::fakeKey(const Keystroke &keystroke)
+bool OSXKeyState::fakeKey(const Keystroke &keystroke)
 {
   switch (keystroke.m_type) {
   case Keystroke::KeyType::Button: {
@@ -654,6 +654,8 @@ void OSXKeyState::fakeKey(const Keystroke &keystroke)
     break;
   }
   }
+
+  return true;
 }
 
 void OSXKeyState::getKeyMapForSpecialKeys(deskflow::KeyMap &keyMap, int32_t group) const

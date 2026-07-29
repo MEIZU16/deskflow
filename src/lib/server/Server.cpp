@@ -23,6 +23,7 @@
 #include "server/ClientListener.h"
 #include "server/ClientProxy.h"
 #include "server/ClientProxyUnknown.h"
+#include "server/KeyboardRouting.h"
 #include "server/PrimaryClient.h"
 
 #ifdef _WIN32
@@ -53,6 +54,12 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   assert(config.isScreen(primaryClient->getName()));
   assert(m_screen != nullptr);
 
+  // Source capability is a platform contract, independent of whether the
+  // current capture has produced its first valid modifier snapshot.
+  m_keyboardState = m_primaryClient->supportsAuthoritativeKeyboardState()
+                        ? deskflow::neutralKeyboardModifierState(false)
+                        : deskflow::unsupportedKeyboardModifierState();
+
   std::string primaryName = getName(primaryClient);
 
   // clear clipboards
@@ -73,6 +80,10 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   m_events->addHandler(EventTypes::KeyStateKeyRepeat, m_inputFilter, [this](const auto &e) {
     handleKeyRepeatEvent(e);
   });
+  m_events->addHandler(
+      EventTypes::PrimaryScreenKeyboardState, m_primaryClient->getEventTarget(),
+      [this](const auto &e) { handleKeyboardStateEvent(e); }
+  );
   m_events->addHandler(EventTypes::PrimaryScreenButtonDown, m_inputFilter, [this](const auto &e) {
     handleButtonDownEvent(e);
   });
@@ -148,6 +159,7 @@ Server::~Server()
   m_events->removeHandler(KeyStateKeyDown, m_inputFilter);
   m_events->removeHandler(KeyStateKeyUp, m_inputFilter);
   m_events->removeHandler(KeyStateKeyRepeat, m_inputFilter);
+  m_events->removeHandler(PrimaryScreenKeyboardState, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenButtonDown, m_inputFilter);
   m_events->removeHandler(PrimaryScreenButtonUp, m_inputFilter);
   m_events->removeHandler(PrimaryScreenMotionOnPrimary, m_primaryClient->getEventTarget());
@@ -472,11 +484,12 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // cut over
     m_active = dst;
 
-    // increment enter sequence number
-    ++m_seqNum;
+    // increment enter sequence number; zero is reserved for "no session"
+    m_seqNum = deskflow::nextKeyboardSessionSequence(m_seqNum);
 
     // enter new screen
     m_active->enter(x, y, m_seqNum, m_primaryClient->getToggleMask(), forScreensaver);
+    m_active->keyboardState(m_keyboardState);
 
     if (m_enableClipboard) {
       // send the clipboard data to new active screen
@@ -1213,13 +1226,19 @@ void Server::handleKeyDownEvent(const Event &event)
 {
   const auto *info = static_cast<IPlatformScreen::KeyInfo *>(event.getData());
   auto lang = AppUtil::instance().getCurrentLanguageCode();
-  onKeyDown(info->m_key, info->m_mask, info->m_button, lang, info->m_screens.c_str());
+  onKeyDown(
+      info->m_key, info->m_mask, info->m_button, lang, info->m_screens.c_str(),
+      info->m_origin == IKeyState::KeyInfo::Origin::Action
+  );
 }
 
 void Server::handleKeyUpEvent(const Event &event)
 {
   auto *info = static_cast<IPlatformScreen::KeyInfo *>(event.getData());
-  onKeyUp(info->m_key, info->m_mask, info->m_button, info->m_screens.c_str());
+  onKeyUp(
+      info->m_key, info->m_mask, info->m_button, info->m_screens.c_str(),
+      info->m_origin == IKeyState::KeyInfo::Origin::Action
+  );
 }
 
 void Server::handleKeyRepeatEvent(const Event &event)
@@ -1227,6 +1246,25 @@ void Server::handleKeyRepeatEvent(const Event &event)
   const auto *info = static_cast<IPlatformScreen::KeyInfo *>(event.getData());
   auto lang = AppUtil::instance().getCurrentLanguageCode();
   onKeyRepeat(info->m_key, info->m_mask, info->m_count, info->m_button, lang);
+}
+
+void Server::handleKeyboardStateEvent(const Event &event)
+{
+  const auto *state = static_cast<const deskflow::KeyboardModifierState *>(event.getData());
+  if (state == nullptr) {
+    return;
+  }
+
+  LOG_VERBOSE(
+      "keyboard state supported=%d valid=%d depressed=0x%04x latched=0x%04x locked=0x%04x group=%u effective=0x%04x",
+      state->supported, state->valid, state->depressed, state->latched, state->locked, state->group,
+      deskflow::effectiveKeyboardModifiers(*state)
+  );
+
+  m_keyboardState = deskflow::normalizedKeyboardModifierState(*state);
+  if (m_active != m_primaryClient) {
+    m_active->keyboardState(m_keyboardState);
+  }
 }
 
 void Server::handleButtonDownEvent(const Event &event)
@@ -1518,47 +1556,112 @@ void Server::onScreensaver(bool activated)
   }
 }
 
-void Server::onKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang, const char *screens)
+void Server::onKeyDown(
+    KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang, const char *screens, bool isAction
+)
 {
-  LOG_VERBOSE("onKeyDown id=%d mask=0x%04x button=0x%04x lang=%s", id, mask, button, lang.c_str());
+  LOG_VERBOSE(
+      "onKeyDown id=%d mask=0x%04x button=0x%04x lang=%s origin=%s", id, mask, button, lang.c_str(),
+      isAction ? "action" : "physical"
+  );
   assert(m_active != nullptr);
 
+  const bool defaultRoute = IKeyState::KeyInfo::isDefault(screens);
+  const auto sendKeyDown = [&](BaseClientProxy *client) {
+    if (isAction && client->supportsKeyboardState() && !deskflow::isKeyboardModifierKey(id) &&
+        id != kKeySetModifiers && id != kKeyClearModifiers) {
+      const KeyModifierMask actionModifiers = mask & deskflow::kMomentaryModifierMask;
+      if (actionModifiers != 0) {
+        client->keyDown(kKeySetModifiers, actionModifiers, 0, lang);
+      }
+    }
+    client->keyDown(id, mask, button, lang);
+  };
+  const auto shouldSuppressPhysicalModifier = [&](const BaseClientProxy *client, bool authoritativeRoute) {
+    return deskflow::server::suppressPhysicalModifierEdge({
+        .action = isAction,
+        .modifier = deskflow::isKeyboardModifierKey(id),
+        .sourceSupported = m_keyboardState.supported,
+        .destinationProtocol = client->supportsKeyboardState(),
+        .destinationActive = client == m_active,
+        .authoritativeRoute = authoritativeRoute,
+    });
+  };
+
   // relay
-  if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
-    m_active->keyDown(id, mask, button, lang);
+  if (!m_keyboardBroadcasting && defaultRoute) {
+    if (!shouldSuppressPhysicalModifier(m_active, true)) {
+      sendKeyDown(m_active);
+    }
   } else {
-    if (!screens && m_keyboardBroadcasting) {
+    const bool broadcastRoute = m_keyboardBroadcasting && defaultRoute;
+    if (broadcastRoute) {
       screens = m_keyboardBroadcastingScreens.c_str();
       if (IKeyState::KeyInfo::isDefault(screens)) {
         screens = "*";
       }
     }
     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
+      if (shouldSuppressPhysicalModifier(index->second, broadcastRoute && index->second == m_active)) {
+        continue;
+      }
       if (IKeyState::KeyInfo::contains(screens, index->first)) {
-        index->second->keyDown(id, mask, button, lang);
+        sendKeyDown(index->second);
       }
     }
   }
 }
 
-void Server::onKeyUp(KeyID id, KeyModifierMask mask, KeyButton button, const char *screens)
+void Server::onKeyUp(
+    KeyID id, KeyModifierMask mask, KeyButton button, const char *screens, bool isAction
+)
 {
-  LOG_VERBOSE("onKeyUp id=%d mask=0x%04x button=0x%04x", id, mask, button);
+  LOG_VERBOSE(
+      "onKeyUp id=%d mask=0x%04x button=0x%04x origin=%s", id, mask, button, isAction ? "action" : "physical"
+  );
   assert(m_active != nullptr);
 
+  const bool defaultRoute = IKeyState::KeyInfo::isDefault(screens);
+  const auto sendKeyUp = [&](BaseClientProxy *client) {
+    client->keyUp(id, mask, button);
+    if (isAction && client->supportsKeyboardState() && !deskflow::isKeyboardModifierKey(id) &&
+        id != kKeySetModifiers && id != kKeyClearModifiers) {
+      const KeyModifierMask actionModifiers = mask & deskflow::kMomentaryModifierMask;
+      if (actionModifiers != 0) {
+        client->keyDown(kKeyClearModifiers, actionModifiers, 0, AppUtil::instance().getCurrentLanguageCode());
+      }
+    }
+  };
+  const auto shouldSuppressPhysicalModifier = [&](const BaseClientProxy *client, bool authoritativeRoute) {
+    return deskflow::server::suppressPhysicalModifierEdge({
+        .action = isAction,
+        .modifier = deskflow::isKeyboardModifierKey(id),
+        .sourceSupported = m_keyboardState.supported,
+        .destinationProtocol = client->supportsKeyboardState(),
+        .destinationActive = client == m_active,
+        .authoritativeRoute = authoritativeRoute,
+    });
+  };
+
   // relay
-  if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
-    m_active->keyUp(id, mask, button);
+  if (!m_keyboardBroadcasting && defaultRoute) {
+    if (!shouldSuppressPhysicalModifier(m_active, true)) {
+      sendKeyUp(m_active);
+    }
   } else {
-    if (!screens && m_keyboardBroadcasting) {
+    const bool broadcastRoute = m_keyboardBroadcasting && defaultRoute;
+    if (broadcastRoute) {
       screens = m_keyboardBroadcastingScreens.c_str();
       if (IKeyState::KeyInfo::isDefault(screens)) {
         screens = "*";
       }
     }
     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
+      if (shouldSuppressPhysicalModifier(index->second, broadcastRoute && index->second == m_active)) {
+        continue;
+      }
       if (IKeyState::KeyInfo::contains(screens, index->first)) {
-        index->second->keyUp(id, mask, button);
+        sendKeyUp(index->second);
       }
     }
   }
@@ -1572,8 +1675,11 @@ void Server::onKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButto
   );
   assert(m_active != nullptr);
 
-  // relay
-  m_active->keyRepeat(id, mask, count, button, lang);
+  // relay. Modifier repeats are represented by DKST for the active 1.9
+  // session, including while keyboard broadcasting is enabled.
+  if (!m_keyboardState.supported || !m_active->supportsKeyboardState() || !deskflow::isKeyboardModifierKey(id)) {
+    m_active->keyRepeat(id, mask, count, button, lang);
+  }
 }
 
 void Server::onMouseDown(ButtonID id)

@@ -28,12 +28,15 @@ add_library(server STATIC
   ClientProxy1_7.h
   ClientProxy1_8.cpp
   ClientProxy1_8.h
+  ClientProxy1_9.cpp
+  ClientProxy1_9.h
   ClientProxyUnknown.cpp
   ClientProxyUnknown.h
   Config.cpp
   Config.h
   InputFilter.cpp
   InputFilter.h
+  KeyboardRouting.h
   PrimaryClient.cpp
   PrimaryClient.h
   Server.cpp

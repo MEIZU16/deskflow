@@ -19,6 +19,12 @@ private Q_SLOTS:
   void handleKeepAliveAlarm_timeout_queuesDisconnectRequest();
   void handleData_incompleteMessage_queuesDisconnectRequest();
   void parseHandshakeMessage_protocolError_queuesRefusalRequest();
+  void keyboardStateSession_initialStateSeparatesAuthoritativeAndLegacyEntry();
+  void keyboardStateSession_rejectsInactiveZeroAndStaleSequences();
+  void keyboardStateSession_acceptsCurrentSequenceAndNormalizesState();
+  void keyboardStateSession_invalidSnapshotKeepsAuthoritativeSessionWaiting();
+  void keyboardStateSession_unsupportedSourceFallsBackToLegacyState();
+  void keyboardStateProtocol_roundTripsAllWireFields();
 
 private:
   Log m_log;

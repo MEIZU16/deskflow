@@ -11,6 +11,7 @@
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "client/Client.h"
+#include "client/KeyboardStateSession.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardChunk.h"
 #include "deskflow/DeskflowException.h"
@@ -27,9 +28,12 @@
 // ServerProxy
 //
 
-ServerProxy::ServerProxy(Client *client, deskflow::IStream *stream, IEventQueue *events)
+ServerProxy::ServerProxy(
+    Client *client, deskflow::IStream *stream, IEventQueue *events, bool keyboardStateProtocol
+)
     : m_client(client),
       m_stream(stream),
+      m_keyboardStateProtocol(keyboardStateProtocol),
       m_events(events)
 {
   assert(m_client != nullptr);
@@ -273,6 +277,10 @@ ServerProxy::ConnectionResult ServerProxy::parseMessage(const uint8_t *code)
     enter();
   }
 
+  else if (memcmp(code, kMsgDKeyboardState, 4) == 0) {
+    keyboardState();
+  }
+
   else if (memcmp(code, kMsgCLeave, 4) == 0) {
     leave();
   }
@@ -505,6 +513,11 @@ KeyModifierMask ServerProxy::translateModifierMask(KeyModifierMask mask) const
   return newMask;
 }
 
+KeyModifierMask ServerProxy::authoritativeModifierMask(KeyModifierMask eventMask) const
+{
+  return deskflow::client::keyboardStateEventMask(m_keyboardSession, eventMask);
+}
+
 void ServerProxy::enter()
 {
   // parse
@@ -513,6 +526,9 @@ void ServerProxy::enter()
   uint16_t mask;
   uint32_t seqNum;
   ProtocolUtil::readf(m_stream, kMsgCEnter + 4, &x, &y, &seqNum, &mask);
+  if (seqNum == 0) {
+    throw BadClientException("enter sequence number must not be zero");
+  }
   LOG_VERBOSE("recv enter, %d,%d %d %04x", x, y, seqNum, mask);
 
   // discard old compressed mouse motion, if any
@@ -521,6 +537,9 @@ void ServerProxy::enter()
   m_dxMouse = 0;
   m_dyMouse = 0;
   m_seqNum = seqNum;
+  deskflow::client::beginKeyboardStateSession(
+      m_keyboardSession, seqNum, m_keyboardStateProtocol, static_cast<KeyModifierMask>(mask)
+  );
   m_serverLayout = "";
   m_isUserNotifiedAboutLayoutSyncError = false;
 
@@ -536,8 +555,61 @@ void ServerProxy::leave()
   // send last mouse motion
   flushCompressedMouse();
 
+  deskflow::client::endKeyboardStateSession(m_keyboardSession);
+
   // forward
   m_client->leave();
+}
+
+void ServerProxy::keyboardState()
+{
+  uint32_t seqNum = 0;
+  uint8_t supported = 0;
+  uint8_t valid = 0;
+  uint16_t depressed = 0;
+  uint16_t latched = 0;
+  uint16_t locked = 0;
+  uint32_t group = 0;
+  ProtocolUtil::readf(
+      m_stream, kMsgDKeyboardState + 4, &seqNum, &supported, &valid, &depressed, &latched, &locked, &group
+  );
+
+  const auto snapshot =
+      supported == 0
+          ? deskflow::unsupportedKeyboardModifierState()
+          : deskflow::KeyboardModifierState{
+                translateModifierMask(static_cast<KeyModifierMask>(depressed)),
+                translateModifierMask(static_cast<KeyModifierMask>(latched)),
+                translateModifierMask(static_cast<KeyModifierMask>(locked)), group, valid != 0, true
+            };
+  if (!deskflow::client::acceptKeyboardState(m_keyboardSession, seqNum, snapshot)) {
+    LOG_DEBUG(
+        "discard keyboard state for unsupported protocol, inactive, zero, or stale sequence %u, active=%d current sequence=%u",
+        seqNum, m_keyboardSession.active, m_keyboardSession.sequence
+    );
+    return;
+  }
+
+  if (!m_keyboardSession.authoritative) {
+    LOG_DEBUG(
+        "recv unsupported keyboard state source seq=%u; using legacy CINN locks and key-event modifier masks", seqNum
+    );
+    m_client->keyboardState(m_keyboardSession.state);
+    return;
+  }
+
+  if (!m_keyboardSession.state.valid) {
+    LOG_DEBUG("recv unobserved keyboard state seq=%u; keeping ordinary keyboard injection deferred", seqNum);
+    m_client->keyboardState(m_keyboardSession.state);
+    return;
+  }
+
+  LOG_VERBOSE(
+      "recv keyboard state seq=%u supported=1 depressed=0x%04x latched=0x%04x locked=0x%04x group=%u effective=0x%04x",
+      seqNum, m_keyboardSession.state.depressed, m_keyboardSession.state.latched, m_keyboardSession.state.locked,
+      m_keyboardSession.state.group, deskflow::effectiveKeyboardModifiers(m_keyboardSession.state)
+  );
+  m_client->keyboardState(m_keyboardSession.state);
 }
 
 void ServerProxy::setClipboard()
@@ -592,9 +664,13 @@ void ServerProxy::keyDown(uint16_t id, uint16_t mask, uint16_t button, const std
   flushCompressedMouse();
   setActiveServerLanguage(lang);
 
-  // translate
+  // Explicit modifier actions carry their own requested mask. Ordinary key
+  // events use the authoritative snapshot when available and retain the wire
+  // mask when the source announced legacy fallback.
   KeyID id2 = translateKey(static_cast<KeyID>(id));
-  KeyModifierMask mask2 = translateModifierMask(static_cast<KeyModifierMask>(mask));
+  const KeyModifierMask translatedMask = translateModifierMask(static_cast<KeyModifierMask>(mask));
+  const KeyModifierMask mask2 =
+      (id2 == kKeySetModifiers || id2 == kKeyClearModifiers) ? translatedMask : authoritativeModifierMask(translatedMask);
   if (id2 != static_cast<KeyID>(id) || mask2 != static_cast<KeyModifierMask>(mask))
     LOG_VERBOSE("key down translated to id=0x%08x, mask=0x%04x", id2, mask2);
 
@@ -622,7 +698,7 @@ void ServerProxy::keyRepeat()
 
   // translate
   KeyID id2 = translateKey(static_cast<KeyID>(id));
-  KeyModifierMask mask2 = translateModifierMask(static_cast<KeyModifierMask>(mask));
+  KeyModifierMask mask2 = authoritativeModifierMask(translateModifierMask(static_cast<KeyModifierMask>(mask)));
   if (id2 != static_cast<KeyID>(id) || mask2 != static_cast<KeyModifierMask>(mask))
     LOG_VERBOSE("key repeat translated to id=0x%08x, mask=0x%04x", id2, mask2);
 
@@ -644,7 +720,7 @@ void ServerProxy::keyUp()
 
   // translate
   KeyID id2 = translateKey(static_cast<KeyID>(id));
-  KeyModifierMask mask2 = translateModifierMask(static_cast<KeyModifierMask>(mask));
+  KeyModifierMask mask2 = authoritativeModifierMask(translateModifierMask(static_cast<KeyModifierMask>(mask)));
   if (id2 != static_cast<KeyID>(id) || mask2 != static_cast<KeyModifierMask>(mask))
     LOG_VERBOSE("key up translated to id=0x%08x, mask=0x%04x", id2, mask2);
 

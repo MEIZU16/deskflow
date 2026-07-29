@@ -94,6 +94,11 @@ Screen::~Screen()
   LOG_DEBUG("closed display");
 }
 
+bool Screen::supportsAuthoritativeKeyboardState() const
+{
+  return m_screen->supportsAuthoritativeKeyboardState();
+}
+
 void Screen::enable()
 {
   assert(!m_enabled);
@@ -118,7 +123,7 @@ void Screen::disable()
   if (!m_isPrimary && m_entered) {
     leave();
   } else if (m_isPrimary && !m_entered) {
-    enter(0);
+    enter(neutralKeyboardModifierState());
   }
   m_screen->disable();
   if (m_isPrimary) {
@@ -131,7 +136,7 @@ void Screen::disable()
   m_enabled = false;
 }
 
-void Screen::enter(KeyModifierMask toggleMask)
+void Screen::enter(const KeyboardModifierState &initialKeyboardState)
 {
   LOG_INFO("entering screen");
 
@@ -146,7 +151,7 @@ void Screen::enter(KeyModifierMask toggleMask)
   if (m_isPrimary) {
     enterPrimary();
   } else {
-    enterSecondary(toggleMask);
+    enterSecondary(initialKeyboardState);
   }
 
   if (Settings::value(Settings::Core::EnableEnterCommand).toBool()) {
@@ -217,6 +222,12 @@ void Screen::grabClipboard(ClipboardID id)
 void Screen::screensaver(bool) const
 {
   // do nothing
+}
+
+bool Screen::keyboardState(const KeyboardModifierState &state)
+{
+  assert(!m_isPrimary);
+  return m_screen->reconcileKeyboardState(state);
 }
 
 void Screen::keyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)
@@ -443,9 +454,9 @@ void Screen::enterPrimary() const
   // do nothing
 }
 
-void Screen::enterSecondary(KeyModifierMask) const
+void Screen::enterSecondary(const KeyboardModifierState &initialKeyboardState) const
 {
-  // do nothing
+  m_screen->beginKeyboardSession(initialKeyboardState);
 }
 
 void Screen::leavePrimary()
@@ -458,8 +469,7 @@ void Screen::leavePrimary()
 
 void Screen::leaveSecondary()
 {
-  // release any keys we think are still down
-  m_screen->fakeAllKeysUp();
+  m_screen->endKeyboardSession();
 }
 
 std::string Screen::getSecureInputApp() const

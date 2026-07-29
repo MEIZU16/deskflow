@@ -165,6 +165,9 @@ enum class EventTypes : uint32_t
   /// This event is sent when key is repeated. Event data is a pointer to KeyInfo.
   KeyStateKeyRepeat,
 
+  /// This event carries the authoritative physical keyboard modifier state.
+  PrimaryScreenKeyboardState,
+
   /// This event is sent when button is down. Event data is a pointer to ButtonInfo
   PrimaryScreenButtonDown,
 

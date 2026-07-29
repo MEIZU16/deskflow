@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <cctype>
 #include <cstdlib>
+#include <utility>
 
 namespace deskflow {
 
@@ -291,6 +292,25 @@ const KeyMap::KeyItem *KeyMap::mapKey(
     LOG_VERBOSE("mapped to %03x, new state %04x", item->m_button, currentState);
   }
   return item;
+}
+
+bool KeyMap::mapModifierState(
+    Keystrokes &keys, int32_t group, ModifierToKeys &activeModifiers, KeyModifierMask &currentState,
+    KeyModifierMask desiredState, KeyModifierMask managedMask
+) const
+{
+  ModifierToKeys nextModifiers = activeModifiers;
+  KeyModifierMask nextState = currentState;
+  Keystrokes pending;
+
+  if (!keysForModifierState(0, group, nextModifiers, nextState, desiredState, managedMask, 0, pending)) {
+    return false;
+  }
+
+  keys.insert(keys.end(), pending.begin(), pending.end());
+  activeModifiers = std::move(nextModifiers);
+  currentState = nextState;
+  return true;
 }
 
 void KeyMap::setLanguageData(std::vector<std::string> layouts)

@@ -139,6 +139,12 @@ public:
   //! @name accessors
   //@{
 
+  //! Whether this primary platform can publish authoritative keyboard snapshots
+  virtual bool supportsAuthoritativeKeyboardState() const
+  {
+    return false;
+  }
+
   //! Test if is primary screen
   /*!
   Return true iff this screen is a primary screen.

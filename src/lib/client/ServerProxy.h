@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include "client/KeyboardStateSession.h"
 #include "common/Enums.h"
 #include "deskflow/ClipboardChunk.h"
 #include "deskflow/ClipboardTypes.h"
+#include "deskflow/KeyboardState.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/KeyboardLayoutManager.h"
 
@@ -35,7 +37,9 @@ public:
   Process messages from the server on \p stream and forward to
   \p client.
   */
-  ServerProxy(Client *client, deskflow::IStream *stream, IEventQueue *events);
+  ServerProxy(
+      Client *client, deskflow::IStream *stream, IEventQueue *events, bool keyboardStateProtocol = false
+  );
   ServerProxy(ServerProxy const &) = delete;
   ServerProxy(ServerProxy &&) = delete;
   ~ServerProxy();
@@ -74,6 +78,7 @@ private:
   // modifier key translation
   KeyID translateKey(KeyID) const;
   KeyModifierMask translateModifierMask(KeyModifierMask) const;
+  KeyModifierMask authoritativeModifierMask(KeyModifierMask eventMask) const;
 
   // event handlers
   void handleData();
@@ -84,6 +89,7 @@ private:
   // message handlers
   void enter();
   void leave();
+  void keyboardState();
   void setClipboard();
   void grabClipboard();
   void keyDown(uint16_t id, uint16_t mask, uint16_t button, const std::string &lang);
@@ -109,7 +115,9 @@ private:
   Client *m_client = nullptr;
   deskflow::IStream *m_stream = nullptr;
 
+  bool m_keyboardStateProtocol = false;
   uint32_t m_seqNum = 0;
+  deskflow::client::KeyboardStateSession m_keyboardSession;
 
   bool m_compressMouse = false;
   bool m_compressMouseRelative = false;

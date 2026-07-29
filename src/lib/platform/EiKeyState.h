@@ -8,6 +8,7 @@
 #pragma once
 
 #include "deskflow/KeyState.h"
+#include "deskflow/KeyboardState.h"
 #include "platform/EiScreen.h"
 
 #include <xkbcommon/xkbcommon.h>
@@ -35,12 +36,18 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   KeyID mapKeyFromKeyval(std::uint32_t keyval) const;
   void updateXkbState(std::uint32_t keyval, bool isPressed);
+  KeyboardModifierState updateModifierState(
+      std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked, std::uint32_t group
+  );
+  void resetModifierState(bool valid);
+  const KeyboardModifierState &modifierState() const;
   void clearStaleModifiers() override;
 
 protected:
   // KeyState overrides
   void getKeyMap(KeyMap &keyMap) override;
-  void fakeKey(const Keystroke &keystroke) override;
+  bool fakeKey(const Keystroke &keystroke) override;
+  bool isKeyInjectionAvailable() const override;
 
 private:
   std::uint32_t convertModMask(xkb_mod_mask_t xkbModMaskIn) const;
@@ -51,6 +58,7 @@ private:
   xkb_context *m_xkb = nullptr;
   xkb_keymap *m_xkbKeymap = nullptr;
   xkb_state *m_xkbState = nullptr;
+  KeyboardModifierState m_modifierState = neutralKeyboardModifierState(false);
 };
 
 } // namespace deskflow

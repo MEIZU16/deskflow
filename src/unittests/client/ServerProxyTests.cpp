@@ -9,9 +9,11 @@
 #include "base/Event.h"
 #include "base/IEventQueue.h"
 #include "client/Client.h"
+#include "client/KeyboardStateSession.h"
 #include "client/ServerProxy.h"
 #include "deskflow/AppUtil.h"
 #include "deskflow/ProtocolTypes.h"
+#include "deskflow/ProtocolUtil.h"
 #include "io/IStream.h"
 
 #include <QTest>
@@ -83,8 +85,16 @@ public:
     return static_cast<uint32_t>(bytesToRead);
   }
 
-  void write(const void *, uint32_t) override
+  void write(const void *buffer, uint32_t size) override
   {
+    if (buffer != nullptr && size != 0) {
+      m_written.append(static_cast<const char *>(buffer), size);
+    }
+  }
+
+  const std::string &written() const
+  {
+    return m_written;
   }
 
   void flush() override
@@ -121,6 +131,7 @@ public:
 
 private:
   std::deque<std::string> m_chunks;
+  std::string m_written;
   bool m_inputShutdown = false;
 };
 
@@ -330,6 +341,139 @@ void ServerProxyTests::parseHandshakeMessage_protocolError_queuesRefusalRequest(
   QVERIFY(request->kind() == Client::DisconnectRequest::Kind::Refuse);
   QVERIFY(request->refusalReason() == deskflow::core::ConnectionRefusal::ProtocolError);
   QCOMPARE(QString::fromUtf8(request->message()), QStringLiteral("server reported a protocol error"));
+}
+
+void ServerProxyTests::keyboardStateSession_initialStateSeparatesAuthoritativeAndLegacyEntry()
+{
+  const auto authoritative = deskflow::client::initialKeyboardState(
+      true, static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierShift)
+  );
+  QVERIFY(!authoritative.valid);
+  QVERIFY(authoritative.supported);
+  QVERIFY(authoritative == deskflow::neutralKeyboardModifierState(false));
+
+  const auto legacy = deskflow::client::initialKeyboardState(
+      false, static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierShift)
+  );
+  QVERIFY(legacy.valid);
+  QVERIFY(!legacy.supported);
+  QCOMPARE(legacy.depressed, static_cast<KeyModifierMask>(0));
+  QCOMPARE(legacy.latched, static_cast<KeyModifierMask>(0));
+  QCOMPARE(legacy.locked, KeyModifierCapsLock);
+}
+
+void ServerProxyTests::keyboardStateSession_rejectsInactiveZeroAndStaleSequences()
+{
+  deskflow::client::KeyboardStateSession session;
+  const deskflow::KeyboardModifierState state{KeyModifierShift, 0, 0, 2, true, true};
+
+  QVERIFY(!deskflow::client::acceptKeyboardState(session, 1, state));
+  QVERIFY(!deskflow::client::beginKeyboardStateSession(session, 0, true, 0));
+  QVERIFY(!deskflow::client::acceptKeyboardState(session, 0, state));
+
+  QVERIFY(deskflow::client::beginKeyboardStateSession(session, 7, false, KeyModifierCapsLock));
+  QVERIFY(!deskflow::client::acceptKeyboardState(session, 7, state));
+  QVERIFY(!session.authoritative);
+  QVERIFY(session.state.valid);
+  QCOMPARE(session.state.locked, KeyModifierCapsLock);
+
+  QVERIFY(deskflow::client::beginKeyboardStateSession(session, 7, true, 0));
+  QVERIFY(!deskflow::client::acceptKeyboardState(session, 6, state));
+  QVERIFY(!session.state.valid);
+}
+
+void ServerProxyTests::keyboardStateSession_acceptsCurrentSequenceAndNormalizesState()
+{
+  deskflow::client::KeyboardStateSession session;
+  QVERIFY(deskflow::client::beginKeyboardStateSession(session, 9, true, 0));
+
+  const deskflow::KeyboardModifierState state{
+      static_cast<KeyModifierMask>(KeyModifierShift | 0x8000), KeyModifierControl,
+      static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierLevel5Lock), 3, true, true
+  };
+  QVERIFY(deskflow::client::acceptKeyboardState(session, 9, state));
+  QCOMPARE(session.state.depressed, KeyModifierShift);
+  QCOMPARE(session.state.latched, KeyModifierControl);
+  QCOMPARE(session.state.locked, static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierLevel5Lock));
+  QCOMPARE(session.state.group, 3u);
+  QVERIFY(session.state.valid);
+
+  const auto eventMask = static_cast<KeyModifierMask>(KeyModifierAlt | KeyModifierScrollLock | 0x8000);
+  QCOMPARE(
+      deskflow::client::keyboardStateEventMask(session, eventMask),
+      static_cast<KeyModifierMask>(KeyModifierShift | KeyModifierControl | KeyModifierCapsLock | 0x8000)
+  );
+}
+
+void ServerProxyTests::keyboardStateSession_invalidSnapshotKeepsAuthoritativeSessionWaiting()
+{
+  deskflow::client::KeyboardStateSession session;
+  QVERIFY(deskflow::client::beginKeyboardStateSession(session, 11, true, KeyModifierCapsLock));
+  QVERIFY(deskflow::client::acceptKeyboardState(
+      session, 11, deskflow::KeyboardModifierState{KeyModifierShift, 0, 0, 0, true, true}
+  ));
+
+  QVERIFY(deskflow::client::acceptKeyboardState(
+      session, 11, deskflow::KeyboardModifierState{KeyModifierAlt, KeyModifierControl, KeyModifierCapsLock, 4, false, true}
+  ));
+  QVERIFY(session.active);
+  QVERIFY(session.authoritative);
+  QCOMPARE(session.sequence, 11u);
+  QVERIFY(session.state == deskflow::neutralKeyboardModifierState(false));
+  QCOMPARE(deskflow::client::keyboardStateEventMask(session, KeyModifierAlt), KeyModifierAlt);
+}
+
+void ServerProxyTests::keyboardStateSession_unsupportedSourceFallsBackToLegacyState()
+{
+  deskflow::client::KeyboardStateSession session;
+  QVERIFY(deskflow::client::beginKeyboardStateSession(
+      session, 13, true, static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierShift)
+  ));
+  QVERIFY(session.authoritative);
+  QVERIFY(!session.state.valid);
+
+  QVERIFY(deskflow::client::acceptKeyboardState(
+      session, 13, deskflow::unsupportedKeyboardModifierState()
+  ));
+  QVERIFY(session.active);
+  QVERIFY(!session.authoritative);
+  QVERIFY(session.state.valid);
+  QVERIFY(!session.state.supported);
+  QCOMPARE(session.state.locked, KeyModifierCapsLock);
+  QCOMPARE(
+      deskflow::client::keyboardStateEventMask(session, KeyModifierShift),
+      static_cast<KeyModifierMask>(KeyModifierShift)
+  );
+}
+
+void ServerProxyTests::keyboardStateProtocol_roundTripsAllWireFields()
+{
+  FakeStream output;
+  ProtocolUtil::writef(
+      &output, kMsgDKeyboardState, 0xfedcba98u, 1u, 1u, KeyModifierShift, KeyModifierControl,
+      static_cast<KeyModifierMask>(KeyModifierCapsLock | KeyModifierNumLock), 0x89abcdefu
+  );
+
+  FakeStream input;
+  input.push(output.written());
+  std::uint32_t sequence = 0;
+  std::uint8_t supported = 0;
+  std::uint8_t valid = 0;
+  std::uint16_t depressed = 0;
+  std::uint16_t latched = 0;
+  std::uint16_t locked = 0;
+  std::uint32_t group = 0;
+  QVERIFY(ProtocolUtil::readf(
+      &input, kMsgDKeyboardState, &sequence, &supported, &valid, &depressed, &latched, &locked, &group
+  ));
+
+  QCOMPARE(sequence, 0xfedcba98u);
+  QCOMPARE(supported, static_cast<std::uint8_t>(1));
+  QCOMPARE(valid, static_cast<std::uint8_t>(1));
+  QCOMPARE(depressed, static_cast<std::uint16_t>(KeyModifierShift));
+  QCOMPARE(latched, static_cast<std::uint16_t>(KeyModifierControl));
+  QCOMPARE(locked, static_cast<std::uint16_t>(KeyModifierCapsLock | KeyModifierNumLock));
+  QCOMPARE(group, 0x89abcdefu);
 }
 
 QTEST_MAIN(ServerProxyTests)

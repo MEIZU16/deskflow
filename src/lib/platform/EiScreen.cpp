@@ -140,6 +140,7 @@ void EiScreen::initEi()
 
 void EiScreen::cleanupEi()
 {
+  m_emulatingDevices.clear();
   if (m_eiPointer) {
     free(ei_device_get_user_data(m_eiPointer));
     ei_device_set_user_data(m_eiPointer, nullptr);
@@ -342,16 +343,37 @@ void EiScreen::fakeMouseWheel(ScrollDelta delta) const
   ei_device_frame(m_eiPointer, ei_now(m_ei));
 }
 
-void EiScreen::fakeKey(uint32_t keycode, bool isDown) const
+bool EiScreen::fakeKey(uint32_t keycode, bool isDown) const
 {
-  if (!m_eiKeyboard)
-    return;
+  ensureEmulating();
+  if (!canInjectKeyboard()) {
+    return false;
+  }
 
   auto xkbKeycode = keycode + 8;
   m_keyState->updateXkbState(xkbKeycode, isDown);
-  ensureEmulating();
   ei_device_keyboard_key(m_eiKeyboard, keycode, isDown);
   ei_device_frame(m_eiKeyboard, ei_now(m_ei));
+  return true;
+}
+
+bool EiScreen::canInjectKeyboard() const
+{
+  return !m_isPrimary && m_isOnScreen && m_keyboardAvailable && !m_keyboardNeedsRestore && m_eiKeyboard != nullptr;
+}
+
+void EiScreen::beginKeyboardSession(const deskflow::KeyboardModifierState &initialState)
+{
+  if (!m_isPrimary && m_keyboardNeedsRestore) {
+    const bool keyboardAvailable = m_keyboardAvailable;
+    m_keyboardAvailable = false;
+    PlatformScreen::beginKeyboardSession(initialState);
+    m_keyboardAvailable = keyboardAvailable;
+    LOG_DEBUG("deferred keyboard session reconciliation until authoritative modifiers are observed");
+    return;
+  }
+
+  PlatformScreen::beginKeyboardSession(initialState);
 }
 
 void EiScreen::enable()
@@ -377,53 +399,93 @@ void EiScreen::cancelIdleEmulationTimer() const
   }
 }
 
-void EiScreen::ensureEmulating() const
+void EiScreen::startEmulating(ei_device *device) const
 {
-  if (m_isPrimary || !m_isOnScreen)
+  if (device == nullptr || m_emulatingDevices.contains(device)) {
     return;
-
-  if (!m_isEmulating) {
-    ++m_sequenceNumber;
-    if (m_eiPointer)
-      ei_device_start_emulating(m_eiPointer, m_sequenceNumber);
-    if (m_eiKeyboard)
-      ei_device_start_emulating(m_eiKeyboard, m_sequenceNumber);
-    if (m_eiAbs)
-      ei_device_start_emulating(m_eiAbs, m_sequenceNumber);
-    m_isEmulating = true;
+  }
+  if (!m_isPrimary && device == m_eiKeyboard && !m_keyboardAvailable) {
+    return;
   }
 
-  cancelIdleEmulationTimer();
-  if (Settings::value(Settings::Core::PreventSleep).toBool())
+  if (!m_isPrimary && device == m_eiKeyboard) {
+    m_keyboardNeedsRestore = true;
+  }
+  ++m_emulationSequenceNumber;
+  ei_device_start_emulating(device, m_emulationSequenceNumber);
+  m_emulatingDevices.insert(device);
+  LOG_DEBUG(
+      "started emulating device %s sequence=%u", ei_device_get_name(device), m_emulationSequenceNumber
+  );
+}
+
+void EiScreen::stopEmulating(ei_device *device) const
+{
+  if (device == nullptr || !m_emulatingDevices.contains(device)) {
     return;
+  }
+
+  ei_device_stop_emulating(device);
+  m_emulatingDevices.erase(device);
+  LOG_DEBUG("stopped emulating device %s", ei_device_get_name(device));
+}
+
+void EiScreen::ensureEmulating() const
+{
+  if (m_isPrimary || !m_isOnScreen) {
+    return;
+  }
+
+  startEmulating(m_eiPointer);
+  startEmulating(m_eiKeyboard);
+  startEmulating(m_eiAbs);
+
+  cancelIdleEmulationTimer();
+  if (Settings::value(Settings::Core::PreventSleep).toBool()) {
+    return;
+  }
 
   m_idleEmulationTimer = m_events->newOneShotTimer(s_idleEmulationTimeout, nullptr);
-  m_events->addHandler(EventTypes::Timer, m_idleEmulationTimer, [this](const auto &) { stopEmulating(); });
+  m_events->addHandler(EventTypes::Timer, m_idleEmulationTimer, [this](const auto &) { stopIdleEmulating(); });
+}
+
+void EiScreen::stopIdleEmulating() const
+{
+  cancelIdleEmulationTimer();
+
+  const std::vector<ei_device *> devices(m_emulatingDevices.begin(), m_emulatingDevices.end());
+  for (auto *device : devices) {
+    if (!ei_device_has_capability(device, EI_DEVICE_CAP_KEYBOARD)) {
+      stopEmulating(device);
+    }
+  }
 }
 
 void EiScreen::stopEmulating() const
 {
   cancelIdleEmulationTimer();
-  if (!m_isEmulating)
-    return;
-  if (m_eiPointer)
-    ei_device_stop_emulating(m_eiPointer);
-  if (m_eiKeyboard)
-    ei_device_stop_emulating(m_eiKeyboard);
-  if (m_eiAbs)
-    ei_device_stop_emulating(m_eiAbs);
-  m_isEmulating = false;
+
+  const std::vector<ei_device *> devices(m_emulatingDevices.begin(), m_emulatingDevices.end());
+  for (auto *device : devices) {
+    stopEmulating(device);
+  }
 }
 
 void EiScreen::enter()
 {
   m_isOnScreen = true;
-  if (!m_isPrimary && m_eiAbs) {
-    // Emulation is started lazily by ensureEmulating() on the first injected
-    // input and released again after a short idle, so this screen can DPMS-sleep
-    // while the cursor sits here with no relayed activity.
-    fakeMouseMove(m_cursorX, m_cursorY);
-  } else if (m_isPrimary) {
+  if (!m_isPrimary) {
+    if (m_eiAbs) {
+      // Emulation is started lazily by ensureEmulating() on the first injected
+      // input and released again after a short idle, so this screen can DPMS-sleep
+      // while the cursor sits here with no relayed activity.
+      fakeMouseMove(m_cursorX, m_cursorY);
+    } else {
+      // A keyboard-only logical device still needs a transaction before the
+      // first relayed key can be accepted and its modifier baseline observed.
+      ensureEmulating();
+    }
+  } else {
     LOG_DEBUG("releasing input capture at x=%i y=%i", m_cursorX, m_cursorY);
     m_portalInputCapture->release(m_cursorX, m_cursorY);
   }
@@ -438,6 +500,7 @@ void EiScreen::leave()
 {
   if (!m_isPrimary) {
     stopEmulating();
+    m_keyboardNeedsRestore = true;
   }
 
   m_isOnScreen = false;
@@ -631,7 +694,7 @@ void EiScreen::removeDevice(struct ei_device *device)
   }
 
   if (wasTracked) {
-    m_isEmulating = false;
+    m_emulatingDevices.erase(device);
     cancelIdleEmulationTimer();
   }
 
@@ -710,6 +773,56 @@ bool EiScreen::onHotkey(KeyID keyid, bool isPressed, KeyModifierMask mask)
   return false;
 }
 
+void EiScreen::onModifiersEvent(ei_event *event)
+{
+  const auto state = m_keyState->updateModifierState(
+      ei_event_keyboard_get_xkb_mods_depressed(event), ei_event_keyboard_get_xkb_mods_latched(event),
+      ei_event_keyboard_get_xkb_mods_locked(event), ei_event_keyboard_get_xkb_group(event)
+  );
+
+  LOG_VERBOSE(
+      "event: modifiers depressed=0x%04x latched=0x%04x locked=0x%04x group=%u effective=0x%04x",
+      state.depressed, state.latched, state.locked, state.group, effectiveKeyboardModifiers(state)
+  );
+
+  if (!m_isPrimary && m_keyboardNeedsRestore && m_keyboardAvailable) {
+    m_keyboardNeedsRestore = false;
+    if (m_isOnScreen && !m_keyState->restoreKeyboardSession()) {
+      LOG_DEBUG("authoritative keyboard restoration or queued-key replay remains pending after modifier baseline");
+    }
+  }
+
+  if (m_isPrimary) {
+    if (auto *data = allocKeyboardModifierState(state); data != nullptr) {
+      sendEvent(EventTypes::PrimaryScreenKeyboardState, data);
+    } else {
+      LOG_ERR("failed to allocate keyboard modifier state event");
+    }
+  }
+}
+
+void EiScreen::resetKeyboardCaptureState(KeyboardCaptureReset reset)
+{
+  const bool valid = reset == KeyboardCaptureReset::Neutral;
+  m_lastPressed = kKeyNone;
+  if (!valid) {
+    m_keyboardAvailable = false;
+  }
+  m_keyState->resetModifierState(valid);
+  if (!m_isPrimary) {
+    m_keyState->resetKeyboardSession();
+    m_keyboardNeedsRestore = true;
+  }
+
+  if (m_isPrimary) {
+    if (auto *data = allocKeyboardModifierState(m_keyState->modifierState()); data != nullptr) {
+      sendEvent(EventTypes::PrimaryScreenKeyboardState, data);
+    } else {
+      LOG_ERR("failed to allocate keyboard modifier reset event");
+    }
+  }
+}
+
 void EiScreen::onKeyEvent(ei_event *event)
 {
   auto keycode = ei_event_keyboard_get_key(event);
@@ -719,7 +832,9 @@ void EiScreen::onKeyEvent(ei_event *event)
   auto keybutton = static_cast<KeyButton>(keyval);
   bool repeat;
 
-  m_keyState->updateXkbState(keyval, pressed);
+  if (!m_keyState->modifierState().valid) {
+    m_keyState->updateXkbState(keyval, pressed);
+  }
   KeyModifierMask mask = m_keyState->pollActiveModifiers();
 
   repeat = pressed && m_lastPressed == keyid && keyid != kKeyNone;
@@ -876,6 +991,7 @@ void EiScreen::handlePortalSessionClosed()
   // Portal may or may not EI_EVENT_DISCONNECT us before sending the DBus Closed
   // signal. Let's clean up either way.
   LOG_DEBUG("eis screen handling portal session closed");
+  resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
   cleanupEi();
   initEi();
 }
@@ -916,12 +1032,19 @@ void EiScreen::handleSystemEvent(const Event &)
         LOG_INFO("seat %s is ignored", ei_seat_get_name(m_eiSeat));
       }
       break;
-    case EI_EVENT_DEVICE_REMOVED:
+    case EI_EVENT_DEVICE_REMOVED: {
+      const bool keyboardRemoved = device == m_eiKeyboard;
       removeDevice(device);
+      if (keyboardRemoved) {
+        m_keyboardAvailable = false;
+        resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
+      }
       break;
+    }
     case EI_EVENT_SEAT_REMOVED:
       if (seat == m_eiSeat) {
         m_eiSeat = ei_seat_unref(m_eiSeat);
+        resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
       }
       break;
     case EI_EVENT_DISCONNECT:
@@ -931,6 +1054,7 @@ void EiScreen::handleSystemEvent(const Event &)
       // We must release the xdg-portal InputCapture in case it is still active
       // so that the cursor is usable and not stuck on the deskflow server.
       LOG_WARN("disconnected from eis, will afterwards commence attempt to reconnect");
+      resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
       if (m_isPrimary) {
         LOG_DEBUG("re-allocating portal input capture connection and releasing active captures");
         if (m_portalInputCapture) {
@@ -945,30 +1069,59 @@ void EiScreen::handleSystemEvent(const Event &)
       break;
     case EI_EVENT_DEVICE_PAUSED:
       LOG_DEBUG("device %s is paused", ei_device_get_name(device));
-      m_isEmulating = false;
-      cancelIdleEmulationTimer();
+      if (m_emulatingDevices.erase(device) != 0) {
+        cancelIdleEmulationTimer();
+      }
+      if (device == m_eiKeyboard) {
+        m_keyboardAvailable = false;
+        resetKeyboardCaptureState(
+            m_isPrimary ? KeyboardCaptureReset::Neutral : KeyboardCaptureReset::Unobserved
+        );
+      }
       break;
-    case EI_EVENT_DEVICE_RESUMED:
+    case EI_EVENT_DEVICE_RESUMED: {
       LOG_DEBUG("device %s is resumed", ei_device_get_name(device));
-      if (!m_isPrimary && m_isOnScreen) {
+      const bool keyboardResumed = device == m_eiKeyboard;
+      if (keyboardResumed) {
+        m_keyboardAvailable = true;
+        if (!m_isPrimary) {
+          m_keyboardNeedsRestore = true;
+        }
+      }
+      if (m_isPrimary && keyboardResumed) {
+        resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
+      }
+      const bool selectedDevice = device == m_eiPointer || device == m_eiKeyboard || device == m_eiAbs;
+      if (!m_isPrimary && m_isOnScreen && selectedDevice) {
         ensureEmulating();
       }
       break;
+    }
     case EI_EVENT_KEYBOARD_MODIFIERS:
-      // FIXME
+      if (device == m_eiKeyboard) {
+        onModifiersEvent(event);
+      }
       break;
 
     // events below are for a receiver context (barriers)
     case EI_EVENT_FRAME:
       break;
     case EI_EVENT_DEVICE_START_EMULATING:
-      LOG_DEBUG("device %s started emulating", ei_device_get_name(device));
+      LOG_DEBUG("device %s started emulating sequence=%u", ei_device_get_name(device), ei_event_emulating_get_sequence(event));
+      if (device == m_eiKeyboard) {
+        resetKeyboardCaptureState(KeyboardCaptureReset::Unobserved);
+      }
       break;
     case EI_EVENT_DEVICE_STOP_EMULATING:
       LOG_DEBUG("device %s stopped emulating", ei_device_get_name(device));
+      if (device == m_eiKeyboard) {
+        resetKeyboardCaptureState(KeyboardCaptureReset::Neutral);
+      }
       break;
     case EI_EVENT_KEYBOARD_KEY:
-      onKeyEvent(event);
+      if (device == m_eiKeyboard) {
+        onKeyEvent(event);
+      }
       break;
     case EI_EVENT_BUTTON_BUTTON:
       onButtonEvent(event);

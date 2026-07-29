@@ -9,6 +9,7 @@
 
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/IScreen.h"
+#include "deskflow/KeyboardState.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
 #include "deskflow/OptionTypes.h"
@@ -66,6 +67,9 @@ public:
   date).
   */
   virtual void setClipboardDirty(ClipboardID, bool dirty) = 0;
+
+  //! Reconcile the client's keyboard with the server's absolute modifier state
+  virtual void keyboardState(const deskflow::KeyboardModifierState &state) = 0;
 
   //! Notify of key press
   /*!

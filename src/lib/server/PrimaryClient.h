@@ -84,6 +84,9 @@ public:
   */
   void getCursorCenter(int32_t &x, int32_t &y) const;
 
+  //! Whether the primary platform can publish authoritative keyboard snapshots
+  bool supportsAuthoritativeKeyboardState() const;
+
   //! Get toggle key state
   /*!
   Returns the primary screen's current toggle modifier key state.
@@ -114,6 +117,7 @@ public:
   void setClipboard(ClipboardID, const IClipboard *) override;
   void grabClipboard(ClipboardID) override;
   void setClipboardDirty(ClipboardID, bool) override;
+  void keyboardState(const deskflow::KeyboardModifierState &state) override;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &) override;
   void keyUp(KeyID, KeyModifierMask, KeyButton) override;

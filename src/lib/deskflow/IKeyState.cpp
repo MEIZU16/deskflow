@@ -55,6 +55,7 @@ IKeyState::KeyInfo *IKeyState::KeyInfo::alloc(const KeyInfo &x)
   info->m_button = x.m_button;
   info->m_count = x.m_count;
   info->m_screens = x.m_screens;
+  info->m_origin = x.m_origin;
   return info;
 }
 
@@ -86,7 +87,7 @@ bool IKeyState::KeyInfo::equal(const KeyInfo *a, const KeyInfo *b)
 {
   return (
       a->m_key == b->m_key && a->m_mask == b->m_mask && a->m_button == b->m_button && a->m_count == b->m_count &&
-      a->m_screens == b->m_screens
+      a->m_screens == b->m_screens && a->m_origin == b->m_origin
   );
 }
 

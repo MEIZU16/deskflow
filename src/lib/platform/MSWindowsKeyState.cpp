@@ -1160,7 +1160,7 @@ void MSWindowsKeyState::getKeyMap(deskflow::KeyMap &keyMap)
   ActivateKeyboardLayout(activeLayout, 0);
 }
 
-void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
+bool MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
 {
   switch (keystroke.m_type) {
   case Keystroke::KeyType::Button: {
@@ -1216,6 +1216,8 @@ void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)
     }
     break;
   }
+
+  return true;
 }
 
 KeyModifierMask &MSWindowsKeyState::getActiveModifiersRValue()

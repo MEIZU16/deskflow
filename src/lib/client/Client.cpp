@@ -11,6 +11,7 @@
 #include "arch/Arch.h"
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "client/KeyboardStateSession.h"
 #include "client/ServerProxy.h"
 #include "common/NetworkProtocol.h"
 #include "common/Settings.h"
@@ -226,7 +227,13 @@ void Client::enter(int32_t xAbs, int32_t yAbs, uint32_t, KeyModifierMask mask, b
     LOG_VERBOSE("using relative restore position: %d,%d", xAbs, yAbs);
   }
   m_screen->mouseMove(xAbs, yAbs);
-  m_screen->enter(mask);
+  const auto initialKeyboardState =
+      deskflow::client::initialKeyboardState(m_keyboardStateProtocol, mask);
+  LOG_DEBUG(
+      "begin client keyboard session protocol-capable=%d initial-valid=%d legacy-lock-mask=0x%04x",
+      m_keyboardStateProtocol, initialKeyboardState.valid, mask & deskflow::kLockModifierMask
+  );
+  m_screen->enter(initialKeyboardState);
 }
 
 bool Client::leave()
@@ -267,6 +274,15 @@ void Client::grabClipboard(ClipboardID id)
 void Client::setClipboardDirty(ClipboardID, bool)
 {
   assert(0 && "shouldn't be called");
+}
+
+void Client::keyboardState(const deskflow::KeyboardModifierState &state)
+{
+  if (!m_active) {
+    LOG_DEBUG("discarding keyboard state while client screen is inactive");
+    return;
+  }
+  m_screen->keyboardState(state);
 }
 
 void Client::keyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)
@@ -470,7 +486,7 @@ void Client::setupScreen()
   assert(m_server == nullptr);
 
   m_ready = false;
-  m_server = new ServerProxy(this, m_stream, m_events);
+  m_server = new ServerProxy(this, m_stream, m_events, m_keyboardStateProtocol);
   m_events->addHandler(EventTypes::ScreenShapeChanged, getEventTarget(), [this](const auto &) {
     handleShapeChanged();
   });
@@ -525,6 +541,8 @@ void Client::cleanupScreen()
       m_screen->disable();
       m_ready = false;
     }
+    m_active = false;
+    m_keyboardStateProtocol = false;
     m_events->removeHandler(EventTypes::ScreenShapeChanged, getEventTarget());
     m_events->removeHandler(EventTypes::ClipboardGrabbed, getEventTarget());
     delete m_server;
@@ -683,7 +701,11 @@ void Client::handleHello()
     );
   }
 
-  LOG_DEBUG("saying hello back with version %s %d.%d", protocolName.c_str(), kProtocolMajorVersion, helloBackMinor);
+  m_keyboardStateProtocol = helloBackMinor >= kProtocolKeyboardStateMinorVersion;
+  LOG_DEBUG(
+      "saying hello back with version %s %d.%d (keyboard state protocol=%d)", protocolName.c_str(),
+      kProtocolMajorVersion, helloBackMinor, m_keyboardStateProtocol
+  );
 
   // dynamically build write format for hello back since `ProtocolUtil::writef`
   // doesn't support formatting fixed length strings yet.

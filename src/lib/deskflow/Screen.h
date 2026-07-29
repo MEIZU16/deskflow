@@ -9,6 +9,7 @@
 
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/IScreen.h"
+#include "deskflow/KeyboardState.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
 #include "deskflow/OptionTypes.h"
@@ -40,6 +41,9 @@ public:
   //! @name manipulators
   //@{
 
+  //! Whether the primary platform can publish authoritative keyboard snapshots
+  bool supportsAuthoritativeKeyboardState() const;
+
   //! Activate screen
   /*!
   Activate the screen, preparing it to report system and user events.
@@ -57,10 +61,10 @@ public:
 
   //! Enter screen
   /*!
-  Called when the user navigates to this screen.  \p toggleMask has the
-  toggle keys that should be turned on on the secondary screen.
+  Called when the user navigates to this screen. \p initialKeyboardState
+  is either the legacy lock baseline or an invalid state that waits for DKST.
   */
-  void enter(KeyModifierMask toggleMask);
+  void enter(const KeyboardModifierState &initialKeyboardState);
 
   //! Leave screen
   /*!
@@ -103,6 +107,9 @@ public:
   forcibly deactivates it.
   */
   void screensaver(bool activate) const;
+
+  //! Reconcile injected modifiers with the server's authoritative state
+  bool keyboardState(const KeyboardModifierState &state);
 
   //! Notify of key press
   /*!
@@ -286,7 +293,7 @@ protected:
   void disableSecondary();
 
   void enterPrimary() const;
-  void enterSecondary(KeyModifierMask toggleMask) const;
+  void enterSecondary(const KeyboardModifierState &initialKeyboardState) const;
   void leavePrimary();
   void leaveSecondary();
 

@@ -425,7 +425,9 @@ InputFilter::KeystrokeAction::KeystrokeAction(IEventQueue *events, IPlatformScre
       m_press(press),
       m_events(events)
 {
-  // do nothing
+  if (m_keyInfo != nullptr) {
+    m_keyInfo->m_origin = IKeyState::KeyInfo::Origin::Action;
+  }
 }
 
 InputFilter::KeystrokeAction::~KeystrokeAction()
@@ -437,6 +439,9 @@ void InputFilter::KeystrokeAction::adoptInfo(IPlatformScreen::KeyInfo *info)
 {
   free(m_keyInfo);
   m_keyInfo = info;
+  if (m_keyInfo != nullptr) {
+    m_keyInfo->m_origin = IKeyState::KeyInfo::Origin::Action;
+  }
 }
 
 const IPlatformScreen::KeyInfo *InputFilter::KeystrokeAction::getInfo() const
@@ -534,6 +539,7 @@ void InputFilter::MouseButtonAction::perform(const Event &event)
   if (m_buttonInfo.m_mask != 0) {
     KeyID key = m_press ? kKeySetModifiers : kKeyClearModifiers;
     modifierInfo = IKeyState::KeyInfo::alloc(key, m_buttonInfo.m_mask, 0, 1);
+    modifierInfo->m_origin = IKeyState::KeyInfo::Origin::Action;
     m_events->addEvent(Event(KeyStateKeyDown, event.getTarget(), modifierInfo, Event::EventFlags::DeliverImmediately));
   }
 

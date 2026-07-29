@@ -177,6 +177,7 @@ public:
   void setClipboard(ClipboardID, const IClipboard *) override;
   void grabClipboard(ClipboardID) override;
   void setClipboardDirty(ClipboardID, bool) override;
+  void keyboardState(const deskflow::KeyboardModifierState &state) override;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &lang) override;
   void keyUp(KeyID, KeyModifierMask, KeyButton) override;
@@ -229,6 +230,7 @@ private:
   ServerProxy *m_server = nullptr;
   bool m_ready = false;
   bool m_active = false;
+  bool m_keyboardStateProtocol = false;
   bool m_suspended = false;
   bool m_connectOnResume = false;
   bool m_ownClipboard[kClipboardEnd];

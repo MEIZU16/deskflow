@@ -16,6 +16,7 @@ const char *const kMsgHelloBackArgs = "%2i%2i%s";
 const char *const kMsgCNoop = "CNOP";
 const char *const kMsgCClose = "CBYE";
 const char *const kMsgCEnter = "CINN%2i%2i%4i%2i";
+const char *const kMsgDKeyboardState = "DKST%4i%1i%1i%2i%2i%2i%4i";
 const char *const kMsgCLeave = "COUT";
 const char *const kMsgCClipboard = "CCLP%1i%4i";
 const char *const kMsgCScreenSaver = "CSEC%1i";

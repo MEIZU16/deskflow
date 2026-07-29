@@ -53,6 +53,31 @@ void PlatformScreen::fakeAllKeysUp()
   getKeyState()->fakeAllKeysUp();
 }
 
+void PlatformScreen::beginKeyboardSession(const deskflow::KeyboardModifierState &initialState)
+{
+  getKeyState()->beginKeyboardSession(initialState);
+}
+
+bool PlatformScreen::reconcileKeyboardState(const deskflow::KeyboardModifierState &state)
+{
+  return getKeyState()->reconcileKeyboardState(state);
+}
+
+void PlatformScreen::endKeyboardSession()
+{
+  getKeyState()->endKeyboardSession();
+}
+
+void PlatformScreen::resetKeyboardSession()
+{
+  getKeyState()->resetKeyboardSession();
+}
+
+bool PlatformScreen::restoreKeyboardSession()
+{
+  return getKeyState()->restoreKeyboardSession();
+}
+
 bool PlatformScreen::fakeCtrlAltDel()
 {
   return getKeyState()->fakeCtrlAltDel();

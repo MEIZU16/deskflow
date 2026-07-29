@@ -262,7 +262,7 @@ bool XWindowsKeyState::setCurrentLanguageWithDBus(int32_t group) const
   return true;
 }
 
-void XWindowsKeyState::fakeKey(const Keystroke &keystroke)
+bool XWindowsKeyState::fakeKey(const Keystroke &keystroke)
 {
   switch (keystroke.m_type) {
   case Keystroke::KeyType::Button:
@@ -327,6 +327,7 @@ void XWindowsKeyState::fakeKey(const Keystroke &keystroke)
     break;
   }
   XFlush(m_display);
+  return true;
 }
 
 void XWindowsKeyState::updateKeysymMap(deskflow::KeyMap &keyMap)

@@ -217,6 +217,11 @@ public:
       KeyModifierMask desiredMask, bool isAutoRepeat, const std::string &lang
   ) const;
 
+  bool mapModifierState(
+      Keystrokes &keys, int32_t group, ModifierToKeys &activeModifiers, KeyModifierMask &currentState,
+      KeyModifierMask desiredState, KeyModifierMask managedMask
+  ) const;
+
   void setLanguageData(std::vector<std::string> layouts);
 
   //! Get number of groups

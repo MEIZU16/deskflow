@@ -39,6 +39,7 @@ public:
   void setClipboard(ClipboardID, const IClipboard *) override;
   void grabClipboard(ClipboardID) override;
   void setClipboardDirty(ClipboardID, bool) override;
+  void keyboardState(const deskflow::KeyboardModifierState &state) override;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &) override;
   void keyUp(KeyID, KeyModifierMask, KeyButton) override;
@@ -79,6 +80,11 @@ private:
   bool recvGrabClipboard();
 
 protected:
+  uint32_t enterSequenceNumber() const
+  {
+    return m_enterSequenceNumber;
+  }
+
   struct ClientClipboard
   {
   public:
@@ -96,6 +102,7 @@ private:
   using MessageParser = bool (ClientProxy1_0::*)(const uint8_t *);
 
   ClientInfo m_info;
+  uint32_t m_enterSequenceNumber = 0;
   double m_heartbeatAlarm;
   EventQueueTimer *m_heartbeatTimer = nullptr;
   MessageParser m_parser = &ClientProxy1_0::parseHandshakeMessage;

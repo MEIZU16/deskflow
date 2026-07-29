@@ -29,6 +29,17 @@ private Q_SLOTS:
   void isKeyDown_noKeysDown_returnsFalse();
   void isKeyDown_keyDown_retrunsTrue();
   void updateKeyState_pollInsertsSingleKey_keyIsDown();
+  void keyboardState_projectionSeparatesMomentaryLocksAndUnsupportedBits();
+  void beginKeyboardSession_invalidInitialStateDefersOrdinaryKeys();
+  void beginKeyboardSession_unsupportedSourceUsesLegacyEventModifiers();
+  void reconcileKeyboardState_isIdempotentAndReleasesMomentaryModifiers();
+  void reconcileKeyboardState_invalidSnapshotClearsOwnershipAndKeepsKeysDeferred();
+  void reconcileKeyboardState_injectionFailureDoesNotCommitLedger();
+  void modifierOwnership_actionAndAuthoritativeLayersShareCanonicalButton();
+  void keyboardRestorationQueue_replaysInArrivalOrder();
+  void keyboardRestorationQueue_overflowDiscardsWholeTransaction();
+  void endKeyboardSession_restoresLocalLockBaseline();
+  void resetKeyboardSession_discardsLedgerWithoutSyntheticRelease();
 
 private:
   Arch m_arch;

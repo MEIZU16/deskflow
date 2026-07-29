@@ -10,6 +10,9 @@
 #include "deskflow/IKeyState.h"
 #include "deskflow/KeyMap.h"
 
+#include <array>
+#include <deque>
+
 //! Core key state
 /*!
 This class provides key state services.  Subclasses must implement a few
@@ -62,10 +65,16 @@ public:
   bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
   bool fakeKeyUp(KeyButton button) override;
   void fakeAllKeysUp() override;
+  void beginKeyboardSession(const deskflow::KeyboardModifierState &initialState) override;
+  bool reconcileKeyboardState(const deskflow::KeyboardModifierState &state) override;
+  void endKeyboardSession() override;
+  void resetKeyboardSession() override;
+  bool restoreKeyboardSession() override;
   bool fakeMediaKey(KeyID id) override;
 
   bool isKeyDown(KeyButton) const override;
   KeyModifierMask getActiveModifiers() const override;
+  bool hasSyntheticKeys() const;
   // Left abstract
   bool fakeCtrlAltDel() override = 0;
   KeyModifierMask pollActiveModifiers() const override = 0;
@@ -91,9 +100,16 @@ protected:
 
   //! Fake a key event
   /*!
-  Synthesize an event for \p keystroke.
+  Synthesize an event for \p keystroke. Returns false when the platform
+  cannot accept the event, so the synthetic ledger is not committed.
   */
-  virtual void fakeKey(const Keystroke &keystroke) = 0;
+  virtual bool fakeKey(const Keystroke &keystroke) = 0;
+
+  //! Test whether platform injection is currently available
+  virtual bool isKeyInjectionAvailable() const
+  {
+    return true;
+  }
 
   //! Get the active modifiers
   /*!
@@ -150,17 +166,6 @@ public:
   };
 
 private:
-  class ButtonToKeyLess
-  {
-  public:
-    bool operator()(
-        const deskflow::KeyMap::ButtonToKeyMap::value_type &a, const deskflow::KeyMap::ButtonToKeyMap::value_type b
-    ) const
-    {
-      return (a.first < b.first);
-    }
-  };
-
   // not implemented
   KeyState(const KeyState &);
   KeyState &operator=(const KeyState &);
@@ -180,10 +185,65 @@ private:
   void addCombinationEntries();
 
   // synthesize key events.  synthesize auto-repeat events count times.
-  void fakeKeys(const Keystrokes &, uint32_t count);
+  bool fakeKeys(const Keystrokes &, uint32_t count);
 
-  // update key state to match changes to modifiers
-  void updateModifierKeyState(KeyButton button, const ModifierToKeys &oldModifiers, const ModifierToKeys &newModifiers);
+  enum class PendingKeyEventType
+  {
+    Down,
+    Repeat,
+    Up
+  };
+
+  struct PendingKeyEvent
+  {
+    PendingKeyEventType type;
+    KeyID id = kKeyNone;
+    KeyModifierMask mask = 0;
+    int32_t count = 1;
+    KeyButton button = 0;
+    std::string lang;
+  };
+
+  enum class KeyEventResult
+  {
+    Consumed,
+    Injected,
+    Retry
+  };
+
+  bool deferKeyEvent(PendingKeyEvent event);
+  bool replayPendingKeyEvents();
+  void clearPendingKeyEvents();
+  KeyEventResult fakeKeyDownNow(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang);
+  KeyEventResult fakeKeyRepeatNow(
+      KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang
+  );
+  KeyEventResult fakeKeyUpNow(KeyButton button);
+
+  struct ModifierReconcileResult
+  {
+    bool injected = false;
+    bool complete = false;
+  };
+
+  void clearSyntheticState();
+  KeyModifierMask keyEventModifierMask(KeyModifierMask eventMask) const;
+  ModifierReconcileResult reconcileModifierLayer(
+      ModifierToKeys &layer, KeyModifierMask &layerMask, KeyModifierMask desiredMask, bool includeLocks,
+      const char *layerName
+  );
+  void replaceModifierLayer(
+      ModifierToKeys &combined, const ModifierToKeys &oldLayer, const ModifierToKeys &newLayer
+  ) const;
+  void applyModifierReferenceDelta(
+      const ModifierToKeys &oldModifiers, const ModifierToKeys &newModifiers, KeyButton excludedButton1 = 0,
+      KeyButton excludedButton2 = 0
+  );
+  bool eraseClientModifier(ModifierToKeys &modifiers, KeyButton button) const;
+  void refreshClientModifierLayer();
+  void retainActionModifiers(KeyModifierMask mask);
+  void releaseActionModifiers(KeyModifierMask mask);
+  void recomputeActiveModifierMask();
 
   // active modifiers collection callback
   static void addActiveModifierCB(KeyID id, int32_t group, deskflow::KeyMap::KeyItem &keyItem, void *vcontext);
@@ -198,8 +258,17 @@ private:
   // current modifier state
   KeyModifierMask m_mask;
 
-  // the active modifiers and the buttons activating them
+  // Modifier ownership is split by source. The combined map is used by
+  // KeyMap, while each layer decides whether a physical button may be
+  // released when one source drops its reference.
   ModifierToKeys m_activeModifiers;
+  ModifierToKeys m_authoritativeModifiers;
+  ModifierToKeys m_actionModifiers;
+  ModifierToKeys m_clientModifiers;
+  KeyModifierMask m_authoritativeMask = 0;
+  KeyModifierMask m_actionModifierMask = 0;
+  KeyModifierMask m_actionModifierRefs = 0;
+  std::array<std::uint32_t, kKeyModifierNumBits> m_actionModifierRefCounts{};
 
   // current keyboard state (> 0 if pressed, 0 otherwise).  this is
   // initialized to the keyboard state according to the system then
@@ -222,4 +291,14 @@ private:
   IEventQueue *m_events;
 
   bool m_isLangSyncEnabled;
+  bool m_keyboardSessionActive = false;
+  bool m_keyboardSessionAuthoritative = false;
+  bool m_keyboardStateRestored = false;
+  bool m_authoritativeStateOwned = false;
+  KeyModifierMask m_keyboardSessionLockBaseline = 0;
+  deskflow::KeyboardModifierState m_desiredKeyboardState = deskflow::neutralKeyboardModifierState(false);
+  std::deque<PendingKeyEvent> m_pendingKeyEvents;
+  bool m_replayingPendingKeyEvents = false;
+  bool m_pendingKeyEventsOverflowed = false;
+  static constexpr std::size_t s_maxPendingKeyEvents = 1024;
 };

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "base/IEventQueue.h"
+#include "deskflow/KeyboardState.h"
 #include "deskflow/KeyTypes.h"
 
 #include <set>
@@ -30,6 +31,12 @@ public:
   class KeyInfo
   {
   public:
+    enum class Origin
+    {
+      Physical,
+      Action
+    };
+
     static KeyInfo *alloc(KeyID, KeyModifierMask, KeyButton, int32_t count);
     static KeyInfo *alloc(KeyID, KeyModifierMask, KeyButton, int32_t count, const std::set<std::string> &destinations);
     static KeyInfo *alloc(const KeyInfo &);
@@ -46,6 +53,7 @@ public:
     KeyButton m_button;
     int32_t m_count;
     std::string m_screens;
+    Origin m_origin = Origin::Physical;
   };
 
   using KeyButtonSet = std::set<KeyButton>;
@@ -100,6 +108,21 @@ public:
   pressed and updates the key state.
   */
   virtual void fakeAllKeysUp() = 0;
+
+  //! Start a remote keyboard injection session
+  virtual void beginKeyboardSession(const deskflow::KeyboardModifierState &initialState) = 0;
+
+  //! Reconcile injected modifiers with an authoritative state snapshot
+  virtual bool reconcileKeyboardState(const deskflow::KeyboardModifierState &state) = 0;
+
+  //! Release injected keys and end the current keyboard session
+  virtual void endKeyboardSession() = 0;
+
+  //! Forget injected state after the platform has already reset it
+  virtual void resetKeyboardSession() = 0;
+
+  //! Reapply the desired state after the platform becomes available again
+  virtual bool restoreKeyboardSession() = 0;
 
   //! Clear stale modifiers
   /*!

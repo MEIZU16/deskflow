@@ -45,7 +45,10 @@ static const int16_t kProtocolMajorVersion = 1;
  * @note When incrementing the minor version, the Deskflow application version should also increment
  * @since Protocol version 1.0
  */
-static const int16_t kProtocolMinorVersion = 8;
+static const int16_t kProtocolMinorVersion = 9;
+
+//! First protocol minor version with authoritative DKST keyboard state.
+static const int16_t kProtocolKeyboardStateMinorVersion = 9;
 
 /**
  * @brief Default TCP port for Deskflow connections
@@ -355,6 +358,36 @@ extern const char *const kMsgCClose;
  * @since Protocol version 1.0
  */
 extern const char *const kMsgCEnter;
+
+/**
+ * @brief Absolute keyboard modifier state
+ *
+ * **Message Code**: `"DKST"`
+ * **Direction**: Primary → Secondary
+ * **Format**: `"DKST%4i%1i%1i%2i%2i%2i%4i"`
+ * **Parameters**:
+ * - `$1`: Sequence number from the current kMsgCEnter
+ * - `$2`: Whether the source platform supports authoritative keyboard state
+ * - `$3`: Whether this capture has an observed authoritative snapshot
+ * - `$4`: Depressed Deskflow modifier mask
+ * - `$5`: Latched Deskflow modifier mask
+ * - `$6`: Locked Deskflow modifier mask
+ * - `$7`: Effective source XKB group
+ *
+ * The message is an idempotent lifecycle snapshot. Sequence zero is reserved
+ * for "no active keyboard session" and must be rejected. A false capability
+ * field means the session must retain the legacy key-edge and event-mask
+ * behavior. When capability is true, a false validity field means the source
+ * is waiting for a trustworthy snapshot for the current capture. A secondary
+ * must ignore the remaining state fields in that case and keep ordinary
+ * keyboard injection deferred. It must also ignore the entire message when
+ * its sequence number does not match the most recent kMsgCEnter. Protocol 1.9
+ * sends one capability snapshot immediately after every kMsgCEnter, followed
+ * by further snapshots whenever the source state changes.
+ *
+ * @since Protocol version 1.9
+ */
+extern const char *const kMsgDKeyboardState;
 
 /**
  * @brief Leave screen command

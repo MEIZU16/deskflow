@@ -13,6 +13,7 @@
 #include "common/NetworkProtocol.h"
 #include "deskflow/Clipboard.h"
 #include "deskflow/ClipboardTypes.h"
+#include "deskflow/KeyboardState.h"
 #include "deskflow/KeyTypes.h"
 #include "deskflow/MouseTypes.h"
 #include "server/Config.h"
@@ -310,6 +311,7 @@ private:
   void handleKeyDownEvent(const Event &event);
   void handleKeyUpEvent(const Event &event);
   void handleKeyRepeatEvent(const Event &event);
+  void handleKeyboardStateEvent(const Event &event);
   void handleButtonDownEvent(const Event &event);
   void handleButtonUpEvent(const Event &event);
   void handleMotionPrimaryEvent(const Event &event);
@@ -327,8 +329,8 @@ private:
   // event processing
   void onClipboardChanged(const BaseClientProxy *sender, ClipboardID id, uint32_t seqNum);
   void onScreensaver(bool activated);
-  void onKeyDown(KeyID, KeyModifierMask, KeyButton, const std::string &, const char *screens);
-  void onKeyUp(KeyID, KeyModifierMask, KeyButton, const char *screens);
+  void onKeyDown(KeyID, KeyModifierMask, KeyButton, const std::string &, const char *screens, bool isAction);
+  void onKeyUp(KeyID, KeyModifierMask, KeyButton, const char *screens, bool isAction);
   void onKeyRepeat(KeyID, KeyModifierMask, int32_t, KeyButton, const std::string &);
   void onMouseDown(ButtonID);
   void onMouseUp(ButtonID);
@@ -424,6 +426,10 @@ private:
 
   // the sequence number of enter messages
   uint32_t m_seqNum = 0;
+
+  // Source capability is stable for the platform. Snapshot validity changes
+  // independently as capture transactions start, stop, pause, or resume.
+  deskflow::KeyboardModifierState m_keyboardState = deskflow::unsupportedKeyboardModifierState();
 
   // current mouse position (in absolute screen coordinates) on
   // whichever screen is active

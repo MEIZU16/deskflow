@@ -45,6 +45,7 @@ void EiKeyState::initDefaultKeymap()
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
+  m_modifierState = neutralKeyboardModifierState(false);
 }
 
 void EiKeyState::init(int fd, size_t len)
@@ -80,6 +81,7 @@ void EiKeyState::init(int fd, size_t len)
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
+  m_modifierState = neutralKeyboardModifierState(false);
 }
 
 EiKeyState::~EiKeyState()
@@ -97,12 +99,20 @@ bool EiKeyState::fakeCtrlAltDel()
 
 KeyModifierMask EiKeyState::pollActiveModifiers() const
 {
+  if (m_modifierState.valid) {
+    return effectiveKeyboardModifiers(m_modifierState);
+  }
+
   const auto xkbMask = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_EFFECTIVE);
   return convertModMask(xkbMask);
 }
 
 std::int32_t EiKeyState::pollActiveGroup() const
 {
+  if (m_modifierState.valid) {
+    return static_cast<std::int32_t>(m_modifierState.group);
+  }
+
   return xkb_state_serialize_layout(m_xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
 }
 
@@ -300,16 +310,22 @@ void EiKeyState::getKeyMap(deskflow::KeyMap &keyMap)
   keyMap.allowGroupSwitchDuringCompose();
 }
 
-void EiKeyState::fakeKey(const Keystroke &keystroke)
+bool EiKeyState::fakeKey(const Keystroke &keystroke)
 {
-  if (keystroke.m_type != Keystroke::KeyType::Button)
-    return;
+  if (keystroke.m_type != Keystroke::KeyType::Button) {
+    return true;
+  }
 
   LOG_VERBOSE(
       "fake key: %03x (%08x) %s", keystroke.m_data.m_button.m_button, keystroke.m_data.m_button.m_client,
       keystroke.m_data.m_button.m_press ? "down" : "up"
   );
-  m_screen->fakeKey(keystroke.m_data.m_button.m_button, keystroke.m_data.m_button.m_press);
+  return m_screen->fakeKey(keystroke.m_data.m_button.m_button, keystroke.m_data.m_button.m_press);
+}
+
+bool EiKeyState::isKeyInjectionAvailable() const
+{
+  return m_screen->canInjectKeyboard();
 }
 
 KeyID EiKeyState::mapKeyFromKeyval(uint32_t keyval) const
@@ -344,13 +360,34 @@ void EiKeyState::updateXkbState(uint32_t keyval, bool isPressed)
   xkb_state_update_key(m_xkbState, keyval, isPressed ? XKB_KEY_DOWN : XKB_KEY_UP);
 }
 
+KeyboardModifierState EiKeyState::updateModifierState(
+    std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked, std::uint32_t group
+)
+{
+  xkb_state_update_mask(m_xkbState, depressed, latched, locked, 0, 0, group);
+  m_modifierState = normalizedKeyboardModifierState(KeyboardModifierState{
+      convertModMask(depressed), convertModMask(latched), convertModMask(locked), group, true, true
+  });
+  return m_modifierState;
+}
+
+void EiKeyState::resetModifierState(bool valid)
+{
+  xkb_state_update_mask(m_xkbState, 0, 0, 0, 0, 0, 0);
+  m_modifierState = neutralKeyboardModifierState(valid);
+}
+
+const KeyboardModifierState &EiKeyState::modifierState() const
+{
+  return m_modifierState;
+}
+
 void EiKeyState::clearStaleModifiers()
 {
-  // Recreate the XKB state to clear stuck modifiers that happen when
-  // modifier keys are press on client and released on server
   if (m_xkbState) {
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
+  m_modifierState = neutralKeyboardModifierState(false);
 }
 } // namespace deskflow

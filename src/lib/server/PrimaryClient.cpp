@@ -59,9 +59,14 @@ void PrimaryClient::getCursorCenter(int32_t &x, int32_t &y) const
   m_screen->getCursorCenter(x, y);
 }
 
+bool PrimaryClient::supportsAuthoritativeKeyboardState() const
+{
+  return m_screen->supportsAuthoritativeKeyboardState();
+}
+
 KeyModifierMask PrimaryClient::getToggleMask() const
 {
-  return m_screen->pollActiveModifiers();
+  return m_screen->pollActiveModifiers() & deskflow::kLockModifierMask;
 }
 
 bool PrimaryClient::isLockedToScreen() const
@@ -105,7 +110,9 @@ void PrimaryClient::enter(int32_t xAbs, int32_t yAbs, uint32_t seqNum, KeyModifi
   if (!screensaver) {
     m_screen->warpCursor(xAbs, yAbs);
   }
-  m_screen->enter(mask);
+  m_screen->enter(deskflow::KeyboardModifierState{
+      0, 0, mask & deskflow::kLockModifierMask, 0, true, false
+  });
 }
 
 bool PrimaryClient::leave()
@@ -137,6 +144,11 @@ void PrimaryClient::grabClipboard(ClipboardID id)
 void PrimaryClient::setClipboardDirty(ClipboardID id, bool dirty)
 {
   m_clipboardDirty[id] = dirty;
+}
+
+void PrimaryClient::keyboardState(const deskflow::KeyboardModifierState &)
+{
+  // The primary screen already owns the physical keyboard state.
 }
 
 void PrimaryClient::keyDown(KeyID key, KeyModifierMask mask, KeyButton button, const std::string &)

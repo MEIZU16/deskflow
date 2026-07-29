@@ -15,6 +15,7 @@
 #include <libei.h>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 struct ei;
@@ -63,7 +64,11 @@ public:
   void fakeMouseMove(std::int32_t x, std::int32_t y) override;
   void fakeMouseRelativeMove(std::int32_t dx, std::int32_t dy) const override;
   void fakeMouseWheel(ScrollDelta delta) const override;
-  void fakeKey(std::uint32_t keycode, bool isDown) const;
+  bool fakeKey(std::uint32_t keycode, bool isDown) const;
+  bool canInjectKeyboard() const;
+
+  // IKeyState overrides
+  void beginKeyboardSession(const deskflow::KeyboardModifierState &initialState) override;
 
   // IPlatformScreen overrides
   void enable() override;
@@ -79,6 +84,10 @@ public:
   void resetOptions() override;
   void setOptions(const OptionsList &options) override;
   void setSequenceNumber(std::uint32_t) override;
+  bool supportsAuthoritativeKeyboardState() const override
+  {
+    return true;
+  }
   bool isPrimary() const override;
 
   // Send clipboard event (needed by PortalInputCapture)
@@ -113,6 +122,14 @@ private:
   void sendEvent(EventTypes type, void *data);
   ButtonID mapButtonFromEvdev(ei_event *event) const;
   void onKeyEvent(ei_event *event);
+  void onModifiersEvent(ei_event *event);
+  enum class KeyboardCaptureReset
+  {
+    Unobserved,
+    Neutral
+  };
+
+  void resetKeyboardCaptureState(KeyboardCaptureReset reset);
   void onButtonEvent(ei_event *event);
   void sendWheelEvents(ei_device *device, const int threshold, double dx, double dy, bool is_discrete);
   void onPointerScrollEvent(ei_event *event);
@@ -125,6 +142,9 @@ private:
   void handleConnectedToEisEvent(const Event &event);
   void handlePortalSessionClosed();
   void ensureEmulating() const;
+  void startEmulating(ei_device *device) const;
+  void stopEmulating(ei_device *device) const;
+  void stopIdleEmulating() const;
   void stopEmulating() const;
   void cancelIdleEmulationTimer() const;
 
@@ -143,6 +163,8 @@ private:
   EiKeyState *m_keyState = nullptr;
 
   KeyID m_lastPressed = kKeyNone;
+  mutable bool m_keyboardNeedsRestore = false;
+  bool m_keyboardAvailable = false;
 
   // clipboard stuff
   EiClipboard *m_clipboard = nullptr;
@@ -157,11 +179,12 @@ private:
   ei_device *m_eiAbs = nullptr;
 
   mutable std::uint32_t m_sequenceNumber = 0;
+  mutable std::uint32_t m_emulationSequenceNumber = 0;
 
-  // Lazily-started EIS emulation: only grab while relayed input is actually
-  // flowing, and release after a short idle so the compositor can DPMS-sleep
-  // this screen even while the deskflow cursor logically sits on it.
-  mutable bool m_isEmulating = false;
+  // Lazily-started EIS emulation. Pointer-only transactions may be idled,
+  // while a keyboard transaction stays active for the whole remote session
+  // so injected modifiers cannot disappear between ordinary key events.
+  mutable std::set<ei_device *> m_emulatingDevices;
   mutable EventQueueTimer *m_idleEmulationTimer = nullptr;
   // Chosen empirically on one machine in 2026-06; not derived from any protocol constant.
   static constexpr double s_idleEmulationTimeout = 4.0;

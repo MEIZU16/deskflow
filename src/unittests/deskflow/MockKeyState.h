@@ -39,8 +39,9 @@ public:
   void getKeyMap(deskflow::KeyMap &) override
   {
   }
-  void fakeKey(const Keystroke &) override
+  bool fakeKey(const Keystroke &) override
   {
+    return true;
   }
   bool fakeMediaKey(KeyID) override
   {

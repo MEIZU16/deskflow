@@ -6,6 +6,7 @@
 add_library(client STATIC
   Client.cpp
   Client.h
+  KeyboardStateSession.h
   ServerProxy.cpp
   ServerProxy.h
 )

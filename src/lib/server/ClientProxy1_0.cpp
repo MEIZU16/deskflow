@@ -225,6 +225,7 @@ void ClientProxy1_0::getCursorPos(int32_t &x, int32_t &y) const
 
 void ClientProxy1_0::enter(int32_t xAbs, int32_t yAbs, uint32_t seqNum, KeyModifierMask mask, bool)
 {
+  m_enterSequenceNumber = seqNum;
   LOG_VERBOSE("send enter to \"%s\", %d,%d %d %04x", getName().c_str(), xAbs, yAbs, seqNum, mask);
   ProtocolUtil::writef(getStream(), kMsgCEnter, xAbs, yAbs, seqNum, mask);
 }
@@ -255,6 +256,11 @@ void ClientProxy1_0::grabClipboard(ClipboardID id)
 void ClientProxy1_0::setClipboardDirty(ClipboardID id, bool dirty)
 {
   m_clipboard[id].m_dirty = dirty;
+}
+
+void ClientProxy1_0::keyboardState(const deskflow::KeyboardModifierState &)
+{
+  // Absolute keyboard state is available in protocol 1.9 and newer.
 }
 
 void ClientProxy1_0::keyDown(KeyID key, KeyModifierMask mask, KeyButton, const std::string &)

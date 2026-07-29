@@ -9,11 +9,60 @@
 #include "base/Log.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <list>
 
 static const KeyButton kButtonMask = (KeyButton)(IKeyState::s_numButtons - 1);
+
+namespace {
+
+using ModifierToKeys = deskflow::KeyMap::ModifierToKeys;
+
+bool sameModifierEntry(const ModifierToKeys::value_type &left, const ModifierToKeys::value_type &right)
+{
+  return left.first == right.first && left.second == right.second;
+}
+
+ModifierToKeys subtractModifierLayer(const ModifierToKeys &combined, const ModifierToKeys &layer)
+{
+  ModifierToKeys remainingLayer = layer;
+  ModifierToKeys result;
+  for (const auto &entry : combined) {
+    const auto match = std::ranges::find_if(remainingLayer, [&entry](const auto &candidate) {
+      return sameModifierEntry(entry, candidate);
+    });
+    if (match != remainingLayer.end()) {
+      remainingLayer.erase(match);
+    } else {
+      result.insert(entry);
+    }
+  }
+  return result;
+}
+
+KeyModifierMask modifierMask(const ModifierToKeys &modifiers, bool includeLocks)
+{
+  KeyModifierMask mask = 0;
+  for (const auto &[modifier, keyItem] : modifiers) {
+    if (includeLocks || !keyItem.m_lock) {
+      mask |= modifier;
+    }
+  }
+  return mask;
+}
+
+std::size_t buttonReferenceCount(const ModifierToKeys &modifiers, KeyButton button)
+{
+  return std::ranges::count_if(modifiers, [button](const auto &entry) {
+    return !entry.second.m_lock && entry.second.m_button == button;
+  });
+}
+
+} // namespace
 
 static const KeyID s_decomposeTable[] = {
     // spacing version of dead keys
@@ -751,6 +800,14 @@ void KeyState::updateKeyState()
   memset(&m_keyClientData, 0, sizeof(m_keyClientData));
   memset(&m_serverKeys, 0, sizeof(m_serverKeys));
   m_activeModifiers.clear();
+  m_authoritativeModifiers.clear();
+  m_actionModifiers.clear();
+  m_clientModifiers.clear();
+  m_authoritativeMask = 0;
+  m_actionModifierMask = 0;
+  m_actionModifierRefs = 0;
+  m_actionModifierRefCounts.fill(0);
+  m_authoritativeStateOwned = false;
 
   // get the current keyboard state
   KeyButtonSet keysDown;
@@ -762,6 +819,7 @@ void KeyState::updateKeyState()
   // get the current modifier state
   clearStaleModifiers();
   m_mask = pollActiveModifiers();
+  m_authoritativeMask = m_mask & deskflow::kLockModifierMask;
 
   // set active modifiers
   AddActiveModifierContext addModifierContext(pollActiveGroup(), m_mask, m_activeModifiers);
@@ -794,24 +852,74 @@ void KeyState::setHalfDuplexMask(KeyModifierMask mask)
 
 void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, const std::string &lang)
 {
+  const bool sessionBlocked =
+      m_keyboardSessionActive &&
+      (!m_keyboardStateRestored || !m_pendingKeyEvents.empty() || m_pendingKeyEventsOverflowed);
+  if (sessionBlocked || !isKeyInjectionAvailable()) {
+    if (m_keyboardSessionActive) {
+      deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Down, id, mask, 1, serverID, lang});
+      if (m_keyboardStateRestored && isKeyInjectionAvailable()) {
+        replayPendingKeyEvents();
+      }
+    } else {
+      LOG_DEBUG("discarding key down while injection is unavailable outside a keyboard session");
+    }
+    return;
+  }
+
+  const auto result = fakeKeyDownNow(id, mask, serverID, lang);
+  if (result == KeyEventResult::Retry) {
+    deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Down, id, mask, 1, serverID, lang});
+  }
+}
+
+KeyState::KeyEventResult
+KeyState::fakeKeyDownNow(KeyID id, KeyModifierMask mask, KeyButton serverID, const std::string &lang)
+{
+  if (!isKeyInjectionAvailable()) {
+    return KeyEventResult::Retry;
+  }
+
+  if (id == kKeySetModifiers || id == kKeyClearModifiers) {
+    const KeyModifierMask requested = mask & deskflow::kMomentaryModifierMask;
+    const auto previousRefCounts = m_actionModifierRefCounts;
+    const KeyModifierMask previousRefs = m_actionModifierRefs;
+    if (id == kKeySetModifiers) {
+      retainActionModifiers(requested);
+    } else {
+      releaseActionModifiers(requested);
+    }
+    const auto result =
+        reconcileModifierLayer(m_actionModifiers, m_actionModifierMask, m_actionModifierRefs, false, "action");
+    if (!result.injected) {
+      m_actionModifierRefCounts = previousRefCounts;
+      m_actionModifierRefs = previousRefs;
+      return KeyEventResult::Retry;
+    }
+    return KeyEventResult::Injected;
+  }
+
+  mask = keyEventModifierMask(mask);
+
   // if this server key is already down then this is probably a
   // mis-reported autorepeat.
   serverID &= kButtonMask;
   if (m_serverKeys[serverID] != 0) {
-    fakeKeyRepeat(id, mask, 1, serverID, lang);
-    return;
+    return fakeKeyRepeatNow(id, mask, 1, serverID, lang);
   }
 
   // ignore certain keys
   if (isIgnoredKey(id, mask)) {
     LOG_VERBOSE("ignored key %04x %04x", id, mask);
-    return;
+    return KeyEventResult::Consumed;
   }
 
   Keystrokes keys;
-  ModifierToKeys oldActiveModifiers = m_activeModifiers;
+  const ModifierToKeys oldActiveModifiers = m_activeModifiers;
+  ModifierToKeys nextActiveModifiers = m_activeModifiers;
+  KeyModifierMask nextMask = m_mask;
   const deskflow::KeyMap::KeyItem *keyItem =
-      m_keyMap.mapKey(keys, id, pollActiveGroup(), m_activeModifiers, getActiveModifiersRValue(), mask, false, lang);
+      m_keyMap.mapKey(keys, id, pollActiveGroup(), nextActiveModifiers, nextMask, mask, false, lang);
 
   if (keyItem == nullptr) {
     // a media key won't be mapped on mac, so we need to fake it in a
@@ -822,45 +930,90 @@ void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, c
       fakeMediaKey(id);
     }
 
-    return;
+    return KeyEventResult::Consumed;
   }
 
-  auto localID = (KeyButton)(keyItem->m_button & kButtonMask);
-  updateModifierKeyState(localID, oldActiveModifiers, m_activeModifiers);
+  const auto localID = static_cast<KeyButton>(keyItem->m_button & kButtonMask);
+  if (localID != 0 && keyItem->m_generates != 0 && !keyItem->m_lock && m_syntheticKeys[localID] > 0) {
+    std::erase_if(keys, [localID](const Keystroke &key) {
+      return key.m_type == Keystroke::KeyType::Button && key.m_data.m_button.m_button == localID &&
+             key.m_data.m_button.m_press && !key.m_data.m_button.m_repeat;
+    });
+  }
+
+  if (!fakeKeys(keys, 1)) {
+    LOG_WARN("key down was not injected; retaining the previous keyboard ledger");
+    return KeyEventResult::Retry;
+  }
+
+  applyModifierReferenceDelta(oldActiveModifiers, nextActiveModifiers, localID);
   if (localID != 0) {
-    // note keys down
     ++m_keys[localID];
     ++m_syntheticKeys[localID];
     m_keyClientData[localID] = keyItem->m_client;
     m_serverKeys[serverID] = localID;
   }
 
-  // generate key events
-  fakeKeys(keys, 1);
+  m_activeModifiers = std::move(nextActiveModifiers);
+  refreshClientModifierLayer();
+  m_mask = nextMask;
+  return KeyEventResult::Injected;
 }
 
 bool KeyState::fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton serverID, const std::string &lang)
 {
+  const bool sessionBlocked =
+      m_keyboardSessionActive &&
+      (!m_keyboardStateRestored || !m_pendingKeyEvents.empty() || m_pendingKeyEventsOverflowed);
+  if (sessionBlocked || !isKeyInjectionAvailable()) {
+    if (m_keyboardSessionActive) {
+      deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Repeat, id, mask, count, serverID, lang});
+      if (m_keyboardStateRestored && isKeyInjectionAvailable()) {
+        replayPendingKeyEvents();
+      }
+    } else {
+      LOG_DEBUG("discarding key repeat while injection is unavailable outside a keyboard session");
+    }
+    return false;
+  }
+
+  const auto result = fakeKeyRepeatNow(id, mask, count, serverID, lang);
+  if (result == KeyEventResult::Retry) {
+    deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Repeat, id, mask, count, serverID, lang});
+  }
+  return result == KeyEventResult::Injected;
+}
+
+KeyState::KeyEventResult KeyState::fakeKeyRepeatNow(
+    KeyID id, KeyModifierMask mask, int32_t count, KeyButton serverID, const std::string &lang
+)
+{
   LOG_VERBOSE("fakeKeyRepeat");
+  if (!isKeyInjectionAvailable()) {
+    return KeyEventResult::Retry;
+  }
+  mask = keyEventModifierMask(mask);
   serverID &= kButtonMask;
 
   // if we haven't seen this button go down then ignore it
-  KeyButton oldLocalID = m_serverKeys[serverID];
+  const KeyButton oldLocalID = m_serverKeys[serverID];
   if (oldLocalID == 0) {
-    return false;
+    return KeyEventResult::Consumed;
   }
 
   // get keys for key repeat
   Keystrokes keys;
-  ModifierToKeys oldActiveModifiers = m_activeModifiers;
+  const ModifierToKeys oldActiveModifiers = m_activeModifiers;
+  ModifierToKeys nextActiveModifiers = m_activeModifiers;
+  KeyModifierMask nextMask = m_mask;
   const deskflow::KeyMap::KeyItem *keyItem =
-      m_keyMap.mapKey(keys, id, pollActiveGroup(), m_activeModifiers, getActiveModifiersRValue(), mask, true, lang);
+      m_keyMap.mapKey(keys, id, pollActiveGroup(), nextActiveModifiers, nextMask, mask, true, lang);
   if (keyItem == nullptr) {
-    return false;
+    return KeyEventResult::Consumed;
   }
-  auto localID = (KeyButton)(keyItem->m_button & kButtonMask);
+  const auto localID = static_cast<KeyButton>(keyItem->m_button & kButtonMask);
   if (localID == 0) {
-    return false;
+    return KeyEventResult::Consumed;
   }
 
   // if the KeyButton for the auto-repeat is not the same as for the
@@ -879,64 +1032,420 @@ bool KeyState::fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyB
       }
     }
 
-    // note that old key is now up
-    --m_keys[oldLocalID];
-    --m_syntheticKeys[oldLocalID];
+    if (m_syntheticKeys[oldLocalID] > 1) {
+      std::erase_if(keys, [oldLocalID](const Keystroke &key) {
+        return key.m_type == Keystroke::KeyType::Button && key.m_data.m_button.m_button == oldLocalID &&
+               !key.m_data.m_button.m_press;
+      });
+    }
+    if (m_syntheticKeys[localID] > 0) {
+      std::erase_if(keys, [localID](const Keystroke &key) {
+        return key.m_type == Keystroke::KeyType::Button && key.m_data.m_button.m_button == localID &&
+               key.m_data.m_button.m_press && !key.m_data.m_button.m_repeat;
+      });
+    }
+  }
 
-    // note keys down
-    updateModifierKeyState(localID, oldActiveModifiers, m_activeModifiers);
+  if (!fakeKeys(keys, count)) {
+    LOG_WARN("key repeat was not injected; retaining the previous keyboard ledger");
+    return KeyEventResult::Retry;
+  }
+
+  if (localID != oldLocalID) {
+    applyModifierReferenceDelta(oldActiveModifiers, nextActiveModifiers, oldLocalID, localID);
+    if (m_keys[oldLocalID] > 0) {
+      --m_keys[oldLocalID];
+    }
+    if (m_syntheticKeys[oldLocalID] > 0) {
+      --m_syntheticKeys[oldLocalID];
+    }
     ++m_keys[localID];
     ++m_syntheticKeys[localID];
     m_keyClientData[localID] = keyItem->m_client;
     m_serverKeys[serverID] = localID;
   }
 
-  // generate key events
-  fakeKeys(keys, count);
-  return true;
+  m_activeModifiers = std::move(nextActiveModifiers);
+  refreshClientModifierLayer();
+  m_mask = nextMask;
+  return KeyEventResult::Injected;
 }
 
 bool KeyState::fakeKeyUp(KeyButton serverID)
 {
-  // if we haven't seen this button go down then ignore it
-  KeyButton localID = m_serverKeys[serverID & kButtonMask];
-  if (localID == 0) {
+  const bool sessionBlocked =
+      m_keyboardSessionActive &&
+      (!m_keyboardStateRestored || !m_pendingKeyEvents.empty() || m_pendingKeyEventsOverflowed);
+  if (sessionBlocked || !isKeyInjectionAvailable()) {
+    if (m_keyboardSessionActive) {
+      deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Up, kKeyNone, 0, 1, serverID, {}});
+      if (m_keyboardStateRestored && isKeyInjectionAvailable()) {
+        replayPendingKeyEvents();
+      }
+    } else {
+      LOG_DEBUG("discarding key up while injection is unavailable outside a keyboard session");
+    }
     return false;
   }
 
-  // get the sequence of keys to simulate key release
+  const auto result = fakeKeyUpNow(serverID);
+  if (result == KeyEventResult::Retry) {
+    deferKeyEvent(PendingKeyEvent{PendingKeyEventType::Up, kKeyNone, 0, 1, serverID, {}});
+  }
+  return result == KeyEventResult::Injected;
+}
+
+KeyState::KeyEventResult KeyState::fakeKeyUpNow(KeyButton serverID)
+{
+  if (!isKeyInjectionAvailable()) {
+    return KeyEventResult::Retry;
+  }
+
+  serverID &= kButtonMask;
+
+  // if we haven't seen this button go down then ignore it
+  const KeyButton localID = m_serverKeys[serverID];
+  if (localID == 0) {
+    return KeyEventResult::Consumed;
+  }
+
+  ModifierToKeys nextActiveModifiers = m_activeModifiers;
+  eraseClientModifier(nextActiveModifiers, localID);
+
+  // Multiple logical owners of the same canonical modifier share one
+  // physical key press. Only the final owner emits the release.
   Keystrokes keys;
-  keys.push_back(Keystroke(localID, false, false, m_keyClientData[localID]));
+  if (m_syntheticKeys[localID] <= 1) {
+    keys.push_back(Keystroke(localID, false, false, m_keyClientData[localID]));
+  }
 
-  // note keys down
-  --m_keys[localID];
-  --m_syntheticKeys[localID];
+  if (!fakeKeys(keys, 1)) {
+    LOG_WARN("key up was not injected; retaining the previous keyboard ledger");
+    return KeyEventResult::Retry;
+  }
+
+  if (m_keys[localID] > 0) {
+    --m_keys[localID];
+  }
+  if (m_syntheticKeys[localID] > 0) {
+    --m_syntheticKeys[localID];
+  }
   m_serverKeys[serverID] = 0;
+  m_activeModifiers = std::move(nextActiveModifiers);
+  refreshClientModifierLayer();
+  recomputeActiveModifierMask();
+  return KeyEventResult::Injected;
+}
 
-  // check if this is a modifier
-  auto i = m_activeModifiers.begin();
-  while (i != m_activeModifiers.end()) {
-    if (i->second.m_button == localID && !i->second.m_lock) {
-      // modifier is no longer down
-      KeyModifierMask mask = i->first;
+bool KeyState::deferKeyEvent(PendingKeyEvent event)
+{
+  if (!m_keyboardSessionActive || m_replayingPendingKeyEvents) {
+    LOG_DEBUG("discarding key event while no restorable keyboard session is active");
+    return false;
+  }
 
-      ModifierToKeys::iterator tmp = i;
-      ++i;
-      m_activeModifiers.erase(tmp);
+  if (m_pendingKeyEventsOverflowed) {
+    return false;
+  }
 
-      if (!m_activeModifiers.contains(mask)) {
-        // no key for modifier is down so deactivate modifier
-        m_mask &= ~mask;
-        LOG_VERBOSE("new state %04x", m_mask);
-      }
-    } else {
-      ++i;
+  if (event.type == PendingKeyEventType::Repeat && !m_pendingKeyEvents.empty()) {
+    auto &previous = m_pendingKeyEvents.back();
+    if (previous.type == PendingKeyEventType::Repeat && previous.id == event.id && previous.mask == event.mask &&
+        previous.button == event.button && previous.lang == event.lang) {
+      const auto combined = static_cast<std::int64_t>(previous.count) + event.count;
+      previous.count = static_cast<int32_t>(std::min<std::int64_t>(combined, std::numeric_limits<int32_t>::max()));
+      return true;
     }
   }
 
-  // generate key events
-  fakeKeys(keys, 1);
+  if (m_pendingKeyEvents.size() >= s_maxPendingKeyEvents) {
+    LOG_WARN(
+        "keyboard restoration queue exceeded %zu events; discarding the incomplete queued transaction",
+        s_maxPendingKeyEvents
+    );
+    m_pendingKeyEvents.clear();
+    m_pendingKeyEventsOverflowed = true;
+    return false;
+  }
+
+  LOG_VERBOSE(
+      "queued keyboard event type=%d button=0x%04x count=%d while restoration is pending",
+      static_cast<int>(event.type), event.button, event.count
+  );
+  m_pendingKeyEvents.push_back(std::move(event));
   return true;
+}
+
+bool KeyState::replayPendingKeyEvents()
+{
+  if (!m_keyboardSessionActive || !isKeyInjectionAvailable()) {
+    return false;
+  }
+
+  if (m_pendingKeyEventsOverflowed) {
+    LOG_WARN("not replaying keyboard restoration queue because its transaction was incomplete");
+    m_pendingKeyEventsOverflowed = false;
+    return true;
+  }
+
+  if (m_pendingKeyEvents.empty()) {
+    return true;
+  }
+
+  std::size_t replayed = 0;
+  m_replayingPendingKeyEvents = true;
+  while (!m_pendingKeyEvents.empty()) {
+    const auto &event = m_pendingKeyEvents.front();
+    KeyEventResult result = KeyEventResult::Consumed;
+    switch (event.type) {
+    case PendingKeyEventType::Down:
+      result = fakeKeyDownNow(event.id, event.mask, event.button, event.lang);
+      break;
+    case PendingKeyEventType::Repeat:
+      result = fakeKeyRepeatNow(event.id, event.mask, event.count, event.button, event.lang);
+      break;
+    case PendingKeyEventType::Up:
+      result = fakeKeyUpNow(event.button);
+      break;
+    }
+
+    if (result == KeyEventResult::Retry) {
+      m_replayingPendingKeyEvents = false;
+      LOG_DEBUG("paused keyboard restoration replay after %zu events", replayed);
+      return false;
+    }
+
+    m_pendingKeyEvents.pop_front();
+    ++replayed;
+  }
+  m_replayingPendingKeyEvents = false;
+
+  LOG_DEBUG("replayed %zu keyboard events after authoritative restoration", replayed);
+  return true;
+}
+
+void KeyState::clearPendingKeyEvents()
+{
+  if (!m_pendingKeyEvents.empty() || m_pendingKeyEventsOverflowed) {
+    LOG_DEBUG("discarding %zu pending keyboard events at session boundary", m_pendingKeyEvents.size());
+  }
+  m_pendingKeyEvents.clear();
+  m_pendingKeyEventsOverflowed = false;
+  m_replayingPendingKeyEvents = false;
+}
+
+void KeyState::clearSyntheticState()
+{
+  memset(&m_keys, 0, sizeof(m_keys));
+  memset(&m_syntheticKeys, 0, sizeof(m_syntheticKeys));
+  memset(&m_keyClientData, 0, sizeof(m_keyClientData));
+  memset(&m_serverKeys, 0, sizeof(m_serverKeys));
+  m_activeModifiers.clear();
+  m_authoritativeModifiers.clear();
+  m_actionModifiers.clear();
+  m_clientModifiers.clear();
+  m_mask = pollActiveModifiers() & deskflow::kLockModifierMask;
+  m_authoritativeMask = m_mask;
+  m_actionModifierMask = 0;
+  m_actionModifierRefs = 0;
+  m_actionModifierRefCounts.fill(0);
+  m_keyboardStateRestored = false;
+  m_authoritativeStateOwned = false;
+}
+
+KeyModifierMask KeyState::keyEventModifierMask(KeyModifierMask eventMask) const
+{
+  // Active-session events are mapped against the state that was actually
+  // reconciled from DKST. This is especially important for events queued while
+  // the snapshot was invalid: their wire mask predates the restored state.
+  const KeyModifierMask baseMask =
+      (m_keyboardSessionActive && m_keyboardSessionAuthoritative && m_keyboardStateRestored)
+          ? m_authoritativeMask
+          : eventMask;
+
+  // Lock keys are reconciled only by the absolute-state transaction. Ordinary
+  // key mapping must use the lock state that has actually been injected, or it
+  // could toggle a lock while a device-resume baseline is still pending.
+  return (baseMask & ~deskflow::kLockModifierMask) | (m_authoritativeMask & deskflow::kLockModifierMask) |
+         m_actionModifierMask | modifierMask(m_clientModifiers, false);
+}
+
+KeyState::ModifierReconcileResult KeyState::reconcileModifierLayer(
+    ModifierToKeys &layer, KeyModifierMask &layerMask, KeyModifierMask desiredMask, bool includeLocks,
+    const char *layerName
+)
+{
+  if (!isKeyInjectionAvailable()) {
+    return {};
+  }
+
+  desiredMask &= deskflow::kMomentaryModifierMask | (includeLocks ? deskflow::kLockModifierMask : 0);
+  static constexpr std::array<KeyModifierMask, 9> s_managedModifiers = {
+      KeyModifierScrollLock, KeyModifierNumLock, KeyModifierCapsLock, KeyModifierAltGr, KeyModifierSuper,
+      KeyModifierMeta,       KeyModifierAlt,     KeyModifierControl,  KeyModifierShift
+  };
+
+  ModifierToKeys nextLayer = layer;
+  KeyModifierMask nextLayerMask = layerMask;
+  Keystrokes lockKeys;
+  Keystrokes momentaryKeys;
+  bool complete = true;
+  for (const auto modifier : s_managedModifiers) {
+    const bool isLock = (modifier & deskflow::kLockModifierMask) != 0;
+    if (isLock && !includeLocks) {
+      continue;
+    }
+
+    Keystrokes pending;
+    if (!m_keyMap.mapModifierState(
+            pending, pollActiveGroup(), nextLayer, nextLayerMask, desiredMask, modifier
+        )) {
+      LOG_WARN("unable to reconcile %s keyboard modifier 0x%04x", layerName, modifier);
+      complete = false;
+      continue;
+    }
+
+    auto &destination = isLock ? lockKeys : momentaryKeys;
+    destination.insert(destination.end(), pending.begin(), pending.end());
+  }
+
+  ModifierToKeys nextActiveModifiers = m_activeModifiers;
+  replaceModifierLayer(nextActiveModifiers, layer, nextLayer);
+
+  Keystrokes keys = std::move(lockKeys);
+  for (const auto &key : momentaryKeys) {
+    if (key.m_type != Keystroke::KeyType::Button) {
+      keys.push_back(key);
+      continue;
+    }
+
+    const KeyButton button = key.m_data.m_button.m_button;
+    const auto oldRefs = buttonReferenceCount(m_activeModifiers, button);
+    const auto nextRefs = buttonReferenceCount(nextActiveModifiers, button);
+    if ((key.m_data.m_button.m_press && oldRefs == 0 && nextRefs > 0) ||
+        (!key.m_data.m_button.m_press && oldRefs > 0 && nextRefs == 0)) {
+      keys.push_back(key);
+    }
+  }
+
+  if (!fakeKeys(keys, 1)) {
+    LOG_WARN("%s keyboard state reconciliation was not injected; retaining the previous ledger", layerName);
+    return {};
+  }
+
+  applyModifierReferenceDelta(m_activeModifiers, nextActiveModifiers);
+  layer = std::move(nextLayer);
+  layerMask = nextLayerMask;
+  m_activeModifiers = std::move(nextActiveModifiers);
+  recomputeActiveModifierMask();
+
+  LOG_VERBOSE(
+      "reconciled %s keyboard modifiers desired=0x%04x actual=0x%04x generated=%zu complete=%d", layerName,
+      desiredMask, getActiveModifiers(), keys.size(), complete
+  );
+  return ModifierReconcileResult{true, complete};
+}
+
+void KeyState::replaceModifierLayer(
+    ModifierToKeys &combined, const ModifierToKeys &oldLayer, const ModifierToKeys &newLayer
+) const
+{
+  combined = subtractModifierLayer(combined, oldLayer);
+  combined.insert(newLayer.begin(), newLayer.end());
+}
+
+void KeyState::applyModifierReferenceDelta(
+    const ModifierToKeys &oldModifiers, const ModifierToKeys &newModifiers, KeyButton excludedButton1,
+    KeyButton excludedButton2
+)
+{
+  for (KeyButton button = 1; button < IKeyState::s_numButtons; ++button) {
+    if (button == excludedButton1 || button == excludedButton2) {
+      continue;
+    }
+
+    const auto oldRefs = buttonReferenceCount(oldModifiers, button);
+    const auto newRefs = buttonReferenceCount(newModifiers, button);
+    if (newRefs > oldRefs) {
+      const auto added = static_cast<int32_t>(newRefs - oldRefs);
+      m_keys[button] += added;
+      m_syntheticKeys[button] += added;
+      const auto key = std::ranges::find_if(newModifiers, [button](const auto &entry) {
+        return !entry.second.m_lock && entry.second.m_button == button;
+      });
+      if (key != newModifiers.end()) {
+        m_keyClientData[button] = key->second.m_client;
+      }
+    } else if (oldRefs > newRefs) {
+      const auto removed = static_cast<int32_t>(oldRefs - newRefs);
+      m_keys[button] = std::max<int32_t>(0, m_keys[button] - removed);
+      m_syntheticKeys[button] = std::max<int32_t>(0, m_syntheticKeys[button] - removed);
+    }
+  }
+}
+
+bool KeyState::eraseClientModifier(ModifierToKeys &modifiers, KeyButton button) const
+{
+  ModifierToKeys clientModifiers = m_clientModifiers;
+  const auto clientEntry = std::ranges::find_if(clientModifiers, [button](const auto &entry) {
+    return !entry.second.m_lock && entry.second.m_button == button;
+  });
+  if (clientEntry == clientModifiers.end()) {
+    return false;
+  }
+
+  const auto combinedEntry = std::ranges::find_if(modifiers, [&clientEntry](const auto &entry) {
+    return sameModifierEntry(entry, *clientEntry);
+  });
+  if (combinedEntry == modifiers.end()) {
+    return false;
+  }
+
+  modifiers.erase(combinedEntry);
+  return true;
+}
+
+void KeyState::refreshClientModifierLayer()
+{
+  m_clientModifiers = subtractModifierLayer(m_activeModifiers, m_authoritativeModifiers);
+  m_clientModifiers = subtractModifierLayer(m_clientModifiers, m_actionModifiers);
+}
+
+void KeyState::retainActionModifiers(KeyModifierMask mask)
+{
+  for (std::size_t bit = 0; bit < m_actionModifierRefCounts.size(); ++bit) {
+    const KeyModifierMask modifier = KeyModifierMask{1} << bit;
+    if ((mask & modifier) == 0) {
+      continue;
+    }
+
+    if (m_actionModifierRefCounts[bit] == std::numeric_limits<std::uint32_t>::max()) {
+      LOG_WARN("action modifier reference count saturated for modifier 0x%04x", modifier);
+      continue;
+    }
+
+    ++m_actionModifierRefCounts[bit];
+    m_actionModifierRefs |= modifier;
+  }
+}
+
+void KeyState::releaseActionModifiers(KeyModifierMask mask)
+{
+  for (std::size_t bit = 0; bit < m_actionModifierRefCounts.size(); ++bit) {
+    const KeyModifierMask modifier = KeyModifierMask{1} << bit;
+    if ((mask & modifier) == 0 || m_actionModifierRefCounts[bit] == 0) {
+      continue;
+    }
+
+    if (--m_actionModifierRefCounts[bit] == 0) {
+      m_actionModifierRefs &= ~modifier;
+    }
+  }
+}
+
+void KeyState::recomputeActiveModifierMask()
+{
+  m_mask = (m_authoritativeMask & deskflow::kLockModifierMask) | modifierMask(m_activeModifiers, false);
 }
 
 void KeyState::fakeAllKeysUp()
@@ -945,14 +1454,151 @@ void KeyState::fakeAllKeysUp()
   for (KeyButton i = 0; i < IKeyState::s_numButtons; ++i) {
     if (m_syntheticKeys[i] > 0) {
       keys.push_back(Keystroke(i, false, false, m_keyClientData[i]));
-      m_keys[i] = 0;
-      m_syntheticKeys[i] = 0;
     }
   }
-  fakeKeys(keys, 1);
-  memset(&m_serverKeys, 0, sizeof(m_serverKeys));
-  m_activeModifiers.clear();
-  m_mask = pollActiveModifiers();
+
+  if (!isKeyInjectionAvailable()) {
+    clearSyntheticState();
+    return;
+  }
+
+  if (fakeKeys(keys, 1)) {
+    clearSyntheticState();
+  }
+}
+
+void KeyState::beginKeyboardSession(const deskflow::KeyboardModifierState &initialState)
+{
+  LOG_DEBUG(
+      "begin keyboard session supported=%d initial-valid=%d initial-lock-mask=0x%04x", initialState.supported,
+      initialState.valid, initialState.locked & deskflow::kLockModifierMask
+  );
+  clearPendingKeyEvents();
+  if (m_keyboardSessionActive) {
+    endKeyboardSession();
+  } else {
+    clearSyntheticState();
+  }
+
+  m_keyboardSessionLockBaseline = pollActiveModifiers() & deskflow::kLockModifierMask;
+  m_keyboardSessionActive = true;
+  m_keyboardSessionAuthoritative = initialState.supported;
+  m_keyboardStateRestored = false;
+  m_desiredKeyboardState = deskflow::normalizedKeyboardModifierState(initialState);
+  if (m_desiredKeyboardState.valid) {
+    (void)reconcileKeyboardState(m_desiredKeyboardState);
+  } else {
+    LOG_DEBUG("keyboard session is waiting for its first authoritative state snapshot");
+  }
+}
+
+bool KeyState::reconcileKeyboardState(const deskflow::KeyboardModifierState &state)
+{
+  if (!m_keyboardSessionActive) {
+    return false;
+  }
+
+  m_desiredKeyboardState = deskflow::normalizedKeyboardModifierState(state);
+  m_keyboardSessionAuthoritative = m_desiredKeyboardState.supported;
+  if (!m_desiredKeyboardState.valid) {
+    m_keyboardStateRestored = false;
+    if (!m_authoritativeStateOwned) {
+      LOG_DEBUG("authoritative keyboard state is unobserved; no owned state requires cleanup");
+      return false;
+    }
+    if (!isKeyInjectionAvailable()) {
+      LOG_DEBUG("authoritative keyboard state is not observed and injection is unavailable");
+      return false;
+    }
+
+    const auto reset = reconcileModifierLayer(
+        m_authoritativeModifiers, m_authoritativeMask, 0, true, "authoritative reset"
+    );
+    if (!reset.injected || !reset.complete) {
+      LOG_DEBUG("authoritative keyboard reset remains incomplete while waiting for a fresh snapshot");
+    } else {
+      m_authoritativeStateOwned = false;
+      LOG_DEBUG("cleared authoritative keyboard state while waiting for a fresh snapshot");
+    }
+    return false;
+  }
+
+  if (!isKeyInjectionAvailable()) {
+    m_keyboardStateRestored = false;
+    LOG_DEBUG("deferring keyboard state reconciliation while injection is unavailable");
+    return false;
+  }
+
+  const auto result = reconcileModifierLayer(
+      m_authoritativeModifiers, m_authoritativeMask,
+      deskflow::effectiveKeyboardModifiers(m_desiredKeyboardState), true, "authoritative"
+  );
+  if (result.injected) {
+    m_authoritativeStateOwned = true;
+  }
+  if (!result.injected || !result.complete) {
+    m_keyboardStateRestored = false;
+    if (result.injected) {
+      LOG_DEBUG("authoritative keyboard restoration is incomplete; keeping ordinary keys deferred");
+    }
+    return false;
+  }
+
+  m_authoritativeStateOwned = true;
+  m_keyboardStateRestored = true;
+  const bool replayed = replayPendingKeyEvents();
+  return replayed;
+}
+
+void KeyState::endKeyboardSession()
+{
+  LOG_DEBUG(
+      "end keyboard session active=%d restored=%d synthetic=%d pending=%zu lock-baseline=0x%04x",
+      m_keyboardSessionActive, m_keyboardStateRestored, hasSyntheticKeys(), m_pendingKeyEvents.size(),
+      m_keyboardSessionLockBaseline
+  );
+  clearPendingKeyEvents();
+  if (!m_keyboardSessionActive) {
+    return;
+  }
+
+  fakeAllKeysUp();
+  const auto lockRestore = reconcileModifierLayer(
+      m_authoritativeModifiers, m_authoritativeMask, m_keyboardSessionLockBaseline, true, "session lock restore"
+  );
+  if (!lockRestore.injected || !lockRestore.complete) {
+    LOG_WARN(
+        "keyboard session ended before the local lock-state baseline could be fully restored (target=0x%04x)",
+        m_keyboardSessionLockBaseline
+    );
+  }
+
+  clearSyntheticState();
+  m_keyboardSessionActive = false;
+  m_keyboardSessionAuthoritative = false;
+  m_keyboardStateRestored = false;
+  m_keyboardSessionLockBaseline = 0;
+  m_desiredKeyboardState = deskflow::neutralKeyboardModifierState(false);
+}
+
+void KeyState::resetKeyboardSession()
+{
+  LOG_DEBUG(
+      "reset keyboard session ledger active=%d restored=%d synthetic=%d pending=%zu", m_keyboardSessionActive,
+      m_keyboardStateRestored, hasSyntheticKeys(), m_pendingKeyEvents.size()
+  );
+  clearPendingKeyEvents();
+  clearSyntheticState();
+}
+
+bool KeyState::restoreKeyboardSession()
+{
+  LOG_DEBUG(
+      "restore keyboard session active=%d authoritative=%d desired-valid=%d injection-available=%d",
+      m_keyboardSessionActive, m_keyboardSessionAuthoritative, m_desiredKeyboardState.valid,
+      isKeyInjectionAvailable()
+  );
+  return m_keyboardSessionActive && m_desiredKeyboardState.valid && reconcileKeyboardState(m_desiredKeyboardState);
 }
 
 bool KeyState::fakeMediaKey(KeyID)
@@ -968,6 +1614,11 @@ bool KeyState::isKeyDown(KeyButton button) const
 KeyModifierMask KeyState::getActiveModifiers() const
 {
   return m_mask;
+}
+
+bool KeyState::hasSyntheticKeys() const
+{
+  return std::ranges::any_of(m_syntheticKeys, [](const auto count) { return count > 0; });
 }
 
 KeyModifierMask &KeyState::getActiveModifiersRValue()
@@ -1056,11 +1707,14 @@ void KeyState::addCombinationEntries()
   }
 }
 
-void KeyState::fakeKeys(const Keystrokes &keys, uint32_t count)
+bool KeyState::fakeKeys(const Keystrokes &keys, uint32_t count)
 {
   // do nothing if no keys or no repeats
   if (count == 0 || keys.empty()) {
-    return;
+    return true;
+  }
+  if (!isKeyInjectionAvailable()) {
+    return false;
   }
 
   // generate key events
@@ -1073,7 +1727,9 @@ void KeyState::fakeKeys(const Keystrokes &keys, uint32_t count)
         // send repeating events
         for (k = start; k != keys.end() && k->m_type == Keystroke::KeyType::Button && k->m_data.m_button.m_repeat;
              ++k) {
-          fakeKey(*k);
+          if (!fakeKey(*k)) {
+            return false;
+          }
         }
       }
 
@@ -1081,7 +1737,9 @@ void KeyState::fakeKeys(const Keystrokes &keys, uint32_t count)
       // repeat keys, exactly where we'd like to continue from.
     } else if (k->m_type != Keystroke::KeyType::Group || (!k->m_data.m_group.m_restore && m_isLangSyncEnabled)) {
       // send event
-      fakeKey(*k);
+      if (!fakeKey(*k)) {
+        return false;
+      }
 
       // next key
       ++k;
@@ -1090,42 +1748,8 @@ void KeyState::fakeKeys(const Keystrokes &keys, uint32_t count)
       ++k;
     }
   }
-}
 
-void KeyState::updateModifierKeyState(
-    KeyButton button, const ModifierToKeys &oldModifiers, const ModifierToKeys &newModifiers
-)
-{
-  // get the pressed modifier buttons before and after
-  deskflow::KeyMap::ButtonToKeyMap oldKeys;
-  deskflow::KeyMap::ButtonToKeyMap newKeys;
-  for (const auto &[modifier, keyItem] : oldModifiers) {
-    oldKeys.try_emplace(keyItem.m_button, &keyItem);
-  }
-  for (const auto &[modifier, keyItem] : newModifiers) {
-    newKeys.try_emplace(keyItem.m_button, &keyItem);
-  }
-
-  // get the modifier buttons that were pressed or released
-  deskflow::KeyMap::ButtonToKeyMap pressed;
-  deskflow::KeyMap::ButtonToKeyMap released;
-  std::ranges::set_difference(oldKeys, newKeys, std::inserter(released, released.end()), ButtonToKeyLess());
-  std::ranges::set_difference(newKeys, oldKeys, std::inserter(pressed, pressed.end()), ButtonToKeyLess());
-
-  // update state
-  for (deskflow::KeyMap::ButtonToKeyMap::const_iterator i = released.begin(); i != released.end(); ++i) {
-    if (i->first != button) {
-      m_keys[i->first] = 0;
-      m_syntheticKeys[i->first] = 0;
-    }
-  }
-  for (deskflow::KeyMap::ButtonToKeyMap::const_iterator i = pressed.begin(); i != pressed.end(); ++i) {
-    if (i->first != button) {
-      m_keys[i->first] = 1;
-      m_syntheticKeys[i->first] = 1;
-      m_keyClientData[i->first] = i->second->m_client;
-    }
-  }
+  return true;
 }
 
 //

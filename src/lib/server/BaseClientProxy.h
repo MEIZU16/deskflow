@@ -51,6 +51,11 @@ public:
     return false;
   }
 
+  virtual bool supportsKeyboardState() const
+  {
+    return false;
+  }
+
   //@}
 
   // IScreen
@@ -65,6 +70,7 @@ public:
   void setClipboard(ClipboardID, const IClipboard *) override = 0;
   void grabClipboard(ClipboardID) override = 0;
   void setClipboardDirty(ClipboardID, bool) override = 0;
+  void keyboardState(const deskflow::KeyboardModifierState &state) override = 0;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override = 0;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &lang) override = 0;
   void keyUp(KeyID, KeyModifierMask, KeyButton) override = 0;
